@@ -1,0 +1,429 @@
+#Comparison with Wasserman's Universal method
+
+# Make plots wider and shorter
+options(repr.plot.width = 10, repr.plot.height = 5)
+
+install.packages("rootSolve")
+
+install.packages("mvtnorm")
+
+install.packages("pracma")
+
+# --- Libraries ---
+library(MASS)
+library(mvtnorm)
+library(ggplot2)
+library(dplyr)
+library(rootSolve)
+
+#
+# For Wasserman’s (MLE over θ₀ instead of all-reject rule)
+#
+
+library(MASS)
+library(ggplot2)
+
+## ---------------- Parameters ----------------
+true_theta <- c(1,0,0,0,0)   # lies on the boundary in the first 3 dims
+Sigma <- diag(5)
+alpha <- 0.05
+d0 <- 3
+d1 <- 5
+d  <- d1
+
+## ------------- Adjusted alpha' (for pointwise test) -------------
+f_alpha_prime <- function(alpha_prime) {
+  q <- qchisq(1 - alpha_prime, df = d1)
+  lhs <- 1 - alpha
+  rhs <- 0.5 * (pchisq(q, df = d1 - d0) + pchisq(q, df = d1 - d0 + 1))
+  lhs - rhs
+}
+alpha_new <- uniroot(f_alpha_prime, interval = c(1e-12, 1-1e-12))$root
+cat("alpha' =", signif(alpha_new, 6), "\n")
+
+## ------------- point generator (projection-based) -------------
+# proj is the 3D projection of Y_bar (first 3 coords)
+generate_test_points <- function(num_points, radius, proj) {
+  raw_points <- proj + radius * cbind(0, matrix(rnorm(3*(num_points-1)), 3, num_points-1))
+  points_3D <- apply(raw_points, 2, function(v) v / pmax(1, sqrt(sum(v^2))))
+  rbind(points_3D, 0, 0)  # embed in R^5 by appending zeros
+}
+
+## ------------- pointwise test at a single theta0 -------------
+test_theta_0_pointwise <- function(theta0, Y_bar, n, alpha_new) {
+  Tstat <- sum((Y_bar - theta0)^2)
+  crit  <- qchisq(1 - alpha_new, df = d) / n
+  Tstat > crit
+}
+
+## ------------- Universal Inference (composite null via MLE) -------------
+# Null set: ||theta_{1:3}|| <= 1, coords 4-5 = 0
+
+# Restricted MLE in Θ0 given a mean vector m (project 1:3 onto unit ball if needed)
+restricted_MLE_from_mean <- function(m) { ## modified
+  m3 <- m[1:3]
+  nrm <- sqrt(sum(m3^2))
+  if (nrm <= 1) return(c(m3, 0, 0))          # already inside the ball
+  c(m3 / nrm, 0, 0)                          # project 1:3 to boundary
+}
+
+# Split universal test (Wasserman): compare unrestricted vs restricted MLEs
+universal_test_split_MLE <- function(Y, alpha) {
+  n <- nrow(Y); d <- ncol(Y)
+  n1 <- floor(n/2); idx <- sample(1:n, n1)
+  D1 <- Y[idx, , drop = FALSE]
+  D2 <- Y[-idx, , drop = FALSE]
+
+  # unrestricted MLEs (means) on each split
+  th2 <- colMeans(D2)
+
+  # restricted MLEs in Θ0 from the held-out split means
+  th0_D1 <- restricted_MLE_from_mean(colMeans(D1))
+
+  # log-likelihood (up to constants) under Σ = I
+  loglik <- function(mu, data) -0.5 * sum(rowSums((data - matrix(mu, nrow(data), d, byrow=TRUE))^2))
+
+  # Held-out likelihood ratios (alt from the other fold)
+  d1_alt <- loglik(th2, D1); d1_null <- loglik(th0_D1, D1)
+
+  # Guard against overflow
+  U1 <- exp(pmin(700, d1_alt - d1_null))
+
+  as.integer(U1 > 1/alpha)
+}
+
+# Cross-fit universal test (Wasserman): compare unrestricted vs restricted MLEs
+universal_test_crossfit_MLE <- function(Y, alpha) {
+  n <- nrow(Y); d <- ncol(Y)
+  n1 <- floor(n/2); idx <- sample(1:n, n1)
+  D1 <- Y[idx, , drop = FALSE]
+  D2 <- Y[-idx, , drop = FALSE]
+
+  # unrestricted MLEs (means) on each split
+  th1 <- colMeans(D1); th2 <- colMeans(D2)
+
+  # restricted MLEs in Θ0 from the held-out split means
+  th0_D1 <- restricted_MLE_from_mean(colMeans(D1))
+  th0_D2 <- restricted_MLE_from_mean(colMeans(D2))
+
+  # log-likelihood (up to constants) under Σ = I
+  loglik <- function(mu, data) -0.5 * sum(rowSums((data - matrix(mu, nrow(data), d, byrow=TRUE))^2))
+
+  # Held-out likelihood ratios (alt from the other fold)
+  d1_alt <- loglik(th2, D1); d1_null <- loglik(th0_D1, D1)
+  d2_alt <- loglik(th1, D2); d2_null <- loglik(th0_D2, D2)
+
+  # Guard against overflow
+  U1 <- exp(pmin(700, d1_alt - d1_null))
+  U2 <- exp(pmin(700, d2_alt - d2_null))
+
+  Wn <- (U1 + U2) / 2
+  as.integer(Wn > 1/alpha)
+}
+
+## ------------- Simulation wrapper (comparison) -------------
+simulate_compare_methods <- function(sample_sizes, num_points = 50, num_simulations = 1000,
+                                     radius_rule = function(n) 3/sqrt(n)) {
+  out <- data.frame(SampleSize = sample_sizes,
+                    Pointwise = NA_real_, splitLRT = NA_real_, crossLRT = NA_real_,
+                    Pointwise_me = NA_real_, splitLRT_me = NA_real_, crossLRT_me=NA_real_)
+  for (i in seq_along(sample_sizes)) {
+    n <- sample_sizes[i]
+    rej_P  <- 0L
+    rej_UIs <- 0L # split LRT
+    rej_UIc <- 0L # cross-fit LRT
+
+    for (sim in 1:num_simulations) {
+      Y <- mvrnorm(n = n, mu = true_theta, Sigma = Sigma)
+      Ybar <- colMeans(Y)
+
+      ## ---- pointwise composite: ALL candidate points must berejected
+      test_pts <- generate_test_points(num_points, radius_rule(n), Ybar[1:3])
+      rejs <- sapply(1:ncol(test_pts), function(j) test_theta_0_pointwise(test_pts[, j], Ybar, n, alpha_new))
+      if (all(rejs)) rej_P <- rej_P + 1L
+
+      ## ---- Universal inference split LRT (composite via MLE; NO grid of points)
+      rej_UIs <- rej_UIs + universal_test_split_MLE(Y, alpha)
+
+      ## ---- Universal inference cross-fit LRT (composite via MLE; NO grid of points)
+      rej_UIc <- rej_UIc + universal_test_crossfit_MLE(Y, alpha)
+    }
+
+    pP <- rej_P  / num_simulations
+    pUs <- rej_UIs / num_simulations
+    pUc <- rej_UIc / num_simulations
+
+    seP <- if (pP > 0 && pP < 1) sqrt(pP*(1-pP)/num_simulations) else 0
+    seUs <- if (pUs > 0 && pUs < 1) sqrt(pUs*(1-pUs)/num_simulations) else 0
+    seUc <- if (pUc > 0 && pUc < 1) sqrt(pUc*(1-pUc)/num_simulations) else 0
+
+    out$Pointwise[i]      <- pP
+    out$splitLRT[i]   <- pUs
+    out$crossLRT[i] <- pUc
+    out$Pointwise_me[i]    <- 1.96*seP
+    out$splitLRT_me[i]    <- 1.96*seUs
+    out$crossLRT_me[i] <- 1.96*seUc
+  }
+  out
+}
+
+## ---------------- Run sims ----------------
+sample_sizes    <- c(5, 10, 30, 100, 200, 1000)
+num_points      <- 1
+num_simulations <- 40000
+set.seed(12345)
+
+results <- simulate_compare_methods(sample_sizes, num_points, num_simulations)
+print(results)
+
+## Make SampleSize a factor so x–axis has equal spacing categories
+results$SampleSize <- factor(results$SampleSize, levels = sample_sizes)
+
+## ---------------- Reshape to long format: Pointwise vs Split vs Cross ----------------
+results_long <- data.frame(
+  SampleSize = rep(results$SampleSize, times = 3),
+  Method = factor(
+    rep(c("Pointwise", "Universal Split", "Universal Cross"),
+        each = nrow(results)),
+    levels = c("Pointwise", "Universal Split", "Universal Cross")
+  ),
+  Estimate = c(results$Pointwise,
+               results$splitLRT,
+               results$crossLRT),
+  L = c(results$Pointwise - results$Pointwise_me,
+        results$splitLRT - results$splitLRT_me,
+        results$crossLRT - results$crossLRT_me),
+  U = c(results$Pointwise + results$Pointwise_me,
+        results$splitLRT + results$splitLRT_me,
+        results$crossLRT + results$crossLRT_me)
+)
+
+## ---------------- Plot (three curves, legend outside) ----------------
+grey_pal <- c("Pointwise"        = "black",
+              "Universal Split"  = "red4",
+              "Universal Cross"  = "red3")
+
+p <- ggplot(results_long,
+            aes(x = SampleSize, y = Estimate,
+                color = Method, shape = Method, group = Method)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  # error bars around the estimate
+  geom_errorbar(aes(ymin = pmax(0, L),
+                    ymax = pmin(1, U)),
+                width = 0.15) +
+  geom_hline(yintercept = alpha, linetype = "dashed",
+             color = "grey60", linewidth = 1) +
+  scale_color_manual(values = grey_pal) +
+  scale_shape_manual(values = c(19, 17, 15)) +
+  labs(x = "Sample Size (n)", y = "Rejection Rate",
+       title = "Pointwise (Projection Grid) vs Universal Inference\n(Split and Cross-Fit MLE)") +
+  theme_minimal(base_size = 18) +
+  theme(
+    axis.title  = element_text(size = 20, face = "bold"),
+    axis.text   = element_text(size = 16, color = "black"),
+    plot.title  = element_text(size = 22, face = "bold", hjust = 0.5),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+    panel.grid.major.y = element_line(color = "grey85"),
+    legend.title = element_blank(),
+    legend.text  = element_text(size = 16),
+    legend.position = "right",
+    legend.justification = "top",
+    legend.box.margin = margin(0, 12, 0, 0),
+    legend.key.width = unit(1.4, "lines")
+  )
+
+print(p)
+
+
+#############################
+######## Compare power
+#############################
+
+install.packages("reshape2")
+
+library(MASS)
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+
+# ---------- PARAMETERS ----------
+Sigma <- diag(5)
+alpha <- 0.05
+d0 <- 3
+d1 <- 5
+d  <- d1
+
+# adjusted alpha' for pointwise test
+f_alpha_prime <- function(alpha_prime) {
+  q <- qchisq(1 - alpha_prime, df = d1)
+  lhs <- 1 - alpha
+  rhs <- 0.5 * (pchisq(q, df = d1 - d0) + pchisq(q, df = d1 - d0 + 1))
+  lhs - rhs
+}
+alpha_new <- uniroot(f_alpha_prime, interval = c(1e-12, 1-1e-12))$root
+cat("Adjusted alpha' =", alpha_new, "\n")
+
+# ---------- TEST POINT GENERATOR (projection-based) ----------
+generate_test_points <- function(num_points, radius, proj) {
+  raw_points <- proj + radius * cbind(0, matrix(rnorm(3*(num_points-1)), 3, num_points-1))
+  points_3D <- apply(raw_points, 2, function(v) v / pmax(1, sqrt(sum(v^2))))
+  rbind(points_3D, 0, 0)
+}
+
+# ---------- Pointwise Exact test ----------
+test_theta_0_exact <- function(theta0, Y, alpha) {
+  n <- nrow(Y); d <- ncol(Y)
+  Ybar <- colMeans(Y)
+  Tstat <- sum((Ybar - theta0)^2)
+  crit  <- qchisq(1 - alpha, df = d) / n
+  Tstat > crit
+}
+pointwise_test_composite <- function(Y_test, theta0_points, alpha) {
+  rejections <- sapply(1:ncol(theta0_points),
+                       function(j) test_theta_0_exact(theta0_points[,j], Y_test, alpha))
+  as.integer(all(rejections))
+}
+
+# Restricted MLE in Θ0 given a mean vector m (project 1:3 onto unit ball if needed)
+restricted_MLE_from_mean <- function(m) { ## modified
+  m3 <- m[1:3]
+  nrm <- sqrt(sum(m3^2))
+  if (nrm <= 1) return(c(m3, 0, 0))          # already inside the ball
+  c(m3 / nrm, 0, 0)                          # project 1:3 to boundary
+}
+universal_test_split_on_dataset <- function(Y, alpha) {
+  n <- nrow(Y); d <- ncol(Y)
+  n1 <- floor(n/2); idx <- sample(1:n, n1)
+  D1 <- Y[idx, , drop=FALSE]; D0 <- Y[-idx, , drop=FALSE]
+  theta_hat1 <- colMeans(D1)
+  theta_hat0 <- restricted_MLE_from_mean(colMeans(D0))
+  loglik <- function(mu, data) -0.5 * sum(rowSums((data - matrix(mu, nrow(data), d, byrow=TRUE))^2))
+  U <- exp(loglik(theta_hat1, D0) - loglik(theta_hat0, D0))
+  as.integer(U > 1/alpha)
+}
+universal_test_crossfit_on_dataset <- function(Y, alpha) {
+  n <- nrow(Y); d <- ncol(Y)
+  n1 <- floor(n/2); idx <- sample(1:n, n1)
+  D1 <- Y[idx, , drop=FALSE]; D2 <- Y[-idx, , drop=FALSE]
+  theta_hat1 <- colMeans(D1); theta_hat2 <- colMeans(D2)
+  theta0_D1 <- restricted_MLE_from_mean(colMeans(D1))
+  theta0_D2 <- restricted_MLE_from_mean(colMeans(D2))
+  loglik <- function(mu, data) -0.5 * sum(rowSums((data - matrix(mu, nrow(data), d, byrow=TRUE))^2))
+  U1 <- exp(loglik(theta_hat2, D1) - loglik(theta0_D1, D1))
+  U2 <- exp(loglik(theta_hat1, D2) - loglik(theta0_D2, D2))
+  Wn <- (U1 + U2) / 2
+  as.integer(Wn > 1/alpha)
+}
+
+# ---------- Simulation wrapper ----------
+simulate_power <- function(sample_sizes = c(5,10,30,100,200,1000),
+                           effect_sizes = c(1.05, 1.2, 1.5),
+                           num_points = 10,
+                           num_simulations = 1000,
+                           radius_rule = function(n) 3/sqrt(n),
+                           seed = 123) {
+  set.seed(seed)
+  out_list <- list()
+  for (mu_val in effect_sizes) {
+    true_theta <- c(mu_val, rep(0, d-1))
+    res_mat <- data.frame(SampleSize = sample_sizes,
+                          Point = NA, UnivSplit = NA, UnivCross = NA)
+    for (i in seq_along(sample_sizes)) {
+      n_total <- sample_sizes[i]
+      rejP <- rejS <- rejC <- 0
+      for (sim in 1:num_simulations) {
+        Y <- mvrnorm(n = n_total, mu = true_theta, Sigma = Sigma)
+        Ybar <- colMeans(Y)
+        theta0_points <- generate_test_points(num_points, radius_rule(n_total), Ybar[1:3])
+        # pointwise
+        rejP <- rejP + pointwise_test_composite(Y, theta0_points, alpha_new)
+        # universal split & cross-fit
+        rejS <- rejS + universal_test_split_on_dataset(Y, alpha)
+        rejC <- rejC + universal_test_crossfit_on_dataset(Y, alpha)
+      }
+      res_mat$Point[i] <- rejP / num_simulations
+      res_mat$UnivSplit[i] <- rejS / num_simulations
+      res_mat$UnivCross[i] <- rejC / num_simulations
+      cat(sprintf("mu=%.2f n=%d  Pointwise=%.3f  Split=%.3f  Cross=%.3f\n",
+                  mu_val, n_total, res_mat$Point[i], res_mat$UnivSplit[i], res_mat$UnivCross[i]))
+    }
+    out_list[[as.character(mu_val)]] <- res_mat
+  }
+  out_list
+}
+
+# ---------- Run simulation ----------
+sample_sizes <- c(5, 10, 30, 100, 200, 1000)
+effect_sizes <- c(1.05, 1.2, 1.5)
+num_simulations <- 10000
+res_list <- simulate_power(sample_sizes, effect_sizes, num_points=1,
+                           num_simulations=num_simulations, seed=2025)
+
+res_list
+
+# ---------- Combine results & simple plot ----------
+plot_df <- bind_rows(lapply(names(res_list), function(mu) {
+  df <- res_list[[mu]]
+  df$mu <- mu
+  df
+})) %>% mutate(mu = factor(mu, levels=as.character(effect_sizes), labels=sapply(effect_sizes, function(m) bquote(mu == .(m)))))
+
+plot_df_long <- melt(plot_df, id.vars=c("SampleSize","mu"),
+                     variable.name="Method", value.name="Power")
+
+plot_df_long <- plot_df_long %>%
+  mutate(se = sqrt(Power*(1 - Power) / num_simulations),
+         Method = factor(Method,
+                         levels = c("Point", "UnivSplit", "UnivCross"),
+                         labels = c("Pointwise rejection", "Split LRT", "Cross-fit LRT")))
+
+grey_pal <- c("Pointwise rejection"="black", "Split LRT"="grey40", "Cross-fit LRT"="grey60")
+
+g <- ggplot(plot_df_long, aes(x=factor(SampleSize), y=Power,
+                         color=Method, group=Method)) +
+  geom_line(linewidth=1) +
+  geom_point(size=2) +
+  geom_errorbar(aes(ymin=pmax(0, Power - 1.96*se),
+                    ymax=pmin(1, Power + 1.96*se)), width=0.3) +
+  facet_wrap(~mu, nrow=1, labeller = labeller(mu=label_parsed)) +
+  geom_hline(yintercept=alpha, linetype="dashed", color="grey60") +
+  scale_color_manual(values=grey_pal) +
+  scale_shape_manual(values=c(19,17,15)) +
+  labs(x="Sample Size (n)", y="Power") +
+  theme_minimal(base_size=18) +
+  theme(axis.title=element_text(size=20),
+        axis.text=element_text(size=18),
+        strip.text=element_text(size=18),
+        legend.title=element_text(size=18),
+        legend.text=element_text(size=18),
+        legend.position="bottom")
+
+
+#--------------------- Fig6_7 ----------------
+grey_pal <- c("Pointwise rejection"="black", "Split LRT"="red", "Cross-fit LRT"="#FF7F7F")
+
+g <- ggplot(plot_df_long, aes(x=factor(SampleSize), y=Power,
+                         color=Method, group=Method)) +
+  geom_line(linewidth=1) +
+  geom_point(size=2) +
+  geom_errorbar(aes(ymin=pmax(0, Power - 1.96*se),
+                    ymax=pmin(1, Power + 1.96*se)), width=0.3) +
+  facet_wrap(~mu, nrow=1, labeller = labeller(mu=label_parsed)) +
+  geom_hline(yintercept=alpha, linetype="dashed", color="grey60") +
+  scale_color_manual(values=grey_pal) +
+  scale_shape_manual(values=c(19,17,15)) +
+  labs(x="Sample Size (n)", y="Power") +
+  theme_minimal(base_size=18) +
+  theme(axis.title=element_text(size=20),
+        axis.text=element_text(size=18),
+        strip.text=element_text(size=18),
+        legend.title=element_text(size=18),
+        legend.text=element_text(size=18),
+        legend.position="bottom")
+
+# Plot size and call
+options(repr.plot.width = 10, repr.plot.height = 4.5)
+
+g
