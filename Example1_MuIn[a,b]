@@ -1,0 +1,291 @@
+# Simulation comparing pointwise method vs Bonferroni for H0: mu in [a,b]
+library(ggplot2)
+library(dplyr)
+
+simulate_test <- function(n = 20, sigma = 1, a = 0, b = 1,
+                          alpha = 0.05, R = 10000, mu_values = seq(-1, 2, length.out = 50),
+                          seed = 2025) {
+  set.seed(seed)
+  df <- n - 1
+  t_crit_pointwise <- qt(1 - alpha, df)   # pointwise interval endpoints
+  alpha_bc <- alpha / 2                    # Bonferroni per-side
+
+  results <- expand.grid(mu = mu_values, rep = 1:R)
+  results$rej_pointwise <- FALSE
+  results$rej_bonf <- FALSE
+
+  # iterate mu values (vectorized per mu for efficiency)
+  mu_list <- unique(results$mu)
+  out <- lapply(mu_list, function(mu_true) {
+    # simulate R samples
+    X <- matrix(rnorm(n * R, mean = mu_true, sd = sigma), nrow = R, ncol = n)
+    xbar <- rowMeans(X)
+    s <- apply(X, 1, sd)
+
+    # Pointwise rejection: check if xbar outside [a - t_crit * s/sqrt(n), b + t_crit * s/sqrt(n)]
+    lower_pw <- a - t_crit_pointwise * s / sqrt(n)
+    upper_pw <- b + t_crit_pointwise * s / sqrt(n)
+    rej_pw <- (xbar < lower_pw) | (xbar > upper_pw)
+
+    # Bonferroni: left-sided test for H0: mu >= a  (reject if evidence mu < a)
+    tstat_L <- (xbar - a) / (s / sqrt(n))
+    p_left <- pt(tstat_L, df = df)            # small p_left => reject H0: mu >= a
+    rej_left <- p_left < alpha_bc
+
+    # Right-sided test for H0: mu <= b  (reject if evidence mu > b)
+    tstat_R <- (xbar - b) / (s / sqrt(n))
+    p_right <- 1 - pt(tstat_R, df = df)       # small p_right => reject H0: mu <= b
+    rej_right <- p_right < alpha_bc
+
+    rej_bonf <- rej_left | rej_right
+
+    data.frame(mu = mu_true, rej_pointwise = rej_pw, rej_bonf = rej_bonf)
+  })
+
+  df_out <- do.call(rbind, out)
+  summary_df <- df_out %>%
+    group_by(mu) %>%
+    summarize(
+      rejection_rate_pointwise = mean(rej_pointwise),
+      rejection_rate_bonf = mean(rej_bonf),
+      n = n()
+    ) %>% ungroup()
+
+  return(list(raw = df_out, summary = summary_df))
+}
+
+# Set parameters
+n <- 20
+sigma <- 1
+a <- 0
+b <- 1
+alpha <- 0.05
+R <- 10000
+mu_values <- seq(a, b, length.out = 101)
+
+sim <- simulate_test(n = n, sigma = sigma, a = a, b = b,
+                     alpha = alpha, R = R, mu_values = mu_values)
+
+# Plot rejection rate vs true mu
+p <- ggplot(sim$summary, aes(x = mu)) +
+  geom_line(aes(y = rejection_rate_pointwise, color = "Pointwise")) +
+  geom_line(aes(y = rejection_rate_bonf, color = "Bonferroni")) +
+  geom_vline(xintercept = c(a, b), linetype = "dashed") +
+  labs(x = expression(mu), y = "Rejection rate",
+       title = paste0("Empirical rejection rate (n=", n, ", R=", R, ")"),
+       color = "Method") +
+  theme_minimal()
+p + geom_hline(yintercept = 0.05, linetype = "dotted", color = "black")
+
+
+# Empirical size estimates inside [a,b] (e.g., sample some interior points)
+interior <- sim$summary %>% filter(mu >= a & mu <= b)
+size_pw <- mean(interior$rejection_rate_pointwise)    # average over grid inside
+size_bonf <- mean(interior$rejection_rate_bonf)
+cat(sprintf("Avg empirical size (pointwise) over interior: %.4f\n", size_pw))
+cat(sprintf("Avg empirical size (Bonferroni) over interior: %.4f\n", size_bonf))
+
+# Rejection at endpoints specifically
+endpoint_est <- sim$summary %>% filter(mu %in% c(a, b))
+print(endpoint_est)
+
+# --- Rejection rate vs true mu (for one n) ---
+p <- ggplot(sim$summary, aes(x = mu)) +
+  geom_line(aes(y = rejection_rate_pointwise, color = "Pointwise"), linewidth = 1.2) +
+  geom_line(aes(y = rejection_rate_bonf, color = "Bonferroni"), linewidth = 1.2) +
+  geom_vline(xintercept = c(a, b), linetype = "dashed") +
+  geom_hline(yintercept = 0.05, linetype = "dotted", color = "black") +
+  labs(x = expression(mu), y = "Rejection rate",
+       #title = paste0("Empirical rejection rate "),
+       color = "Method") +
+  scale_color_manual(values = c("Pointwise" = "black", "Bonferroni" = "grey70")) +
+  theme_minimal(base_size = 16) +
+  theme(
+    plot.title = element_text(size = 20, face = "bold", hjust = 0.5),
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 16),
+    legend.title = element_text(size = 16),
+    legend.text = element_text(size = 16)
+  )
+
+print(p)
+
+# --- add standard errors and CIs ---
+sim$summary <- sim$summary %>%
+  mutate(
+    se_pointwise = sqrt(rejection_rate_pointwise * (1 - rejection_rate_pointwise) / n),
+    se_bonf = sqrt(rejection_rate_bonf * (1 - rejection_rate_bonf) / n),
+    # 95% CI
+    lower_pw = pmax(0, rejection_rate_pointwise - 1.96 * se_pointwise),
+    upper_pw = pmin(1, rejection_rate_pointwise + 1.96 * se_pointwise),
+    lower_bonf = pmax(0, rejection_rate_bonf - 1.96 * se_bonf),
+    upper_bonf = pmin(1, rejection_rate_bonf + 1.96 * se_bonf)
+  )
+
+# --- plot with error bars ---
+p <- ggplot(sim$summary, aes(x = mu)) +
+  geom_line(aes(y = rejection_rate_pointwise, color = "Pointwise"), linewidth = 1.2) +
+  geom_errorbar(aes(ymin = lower_pw, ymax = upper_pw, color = "Pointwise"), width = 0.02, alpha = 0.4) +
+  geom_line(aes(y = rejection_rate_bonf, color = "Bonferroni"), linewidth = 1.2) +
+  geom_errorbar(aes(ymin = lower_bonf, ymax = upper_bonf, color = "Bonferroni"), width = 0.02, alpha = 0.4) +
+  geom_vline(xintercept = c(a, b), linetype = "dashed") +
+  geom_hline(yintercept = 0.05, linetype = "dotted", color = "black") +
+  labs(x = expression(mu), y = "Rejection rate",
+       color = "Method") +
+  scale_color_manual(values = c("Pointwise" = "black", "Bonferroni" = "grey60")) +
+  scale_y_continuous(
+    limits = c(0, 0.055),
+    breaks = seq(0, 0.055, 0.01)
+  ) +
+  theme_minimal(base_size = 16) +
+  theme(
+    plot.title = element_text(size = 20, face = "bold", hjust = 0.5),
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 16),
+    legend.title = element_text(size = 16),
+    legend.text = element_text(size = 16)
+  )
+
+
+# Make plots wider and shorter
+options(repr.plot.width = 10, repr.plot.height = 4)
+
+p
+
+# --- Libraries ---
+library(ggplot2)
+library(dplyr)
+
+# --- Simulation function ---
+simulate_test <- function(n = 20, sigma = 1, a = 0, b = 1,
+                          alpha = 0.05, R = 5000, mu_values = seq(a, b, length.out = 101),
+                          seed = 2025) {
+  set.seed(seed)
+  df <- n - 1
+  t_crit_pointwise <- qt(1 - alpha, df)   # pointwise interval
+  alpha_bc <- alpha / 2                   # Bonferroni split
+
+  mu_list <- unique(mu_values)
+  out <- lapply(mu_list, function(mu_true) {
+    # simulate R samples
+    X <- matrix(rnorm(n * R, mean = mu_true, sd = sigma), nrow = R, ncol = n)
+    xbar <- rowMeans(X)
+    s <- apply(X, 1, sd)
+
+    # Pointwise rejection
+    lower_pw <- a - t_crit_pointwise * s / sqrt(n)
+    upper_pw <- b + t_crit_pointwise * s / sqrt(n)
+    rej_pw <- (xbar < lower_pw) | (xbar > upper_pw)
+
+    # Bonferroni rejection
+    tstat_L <- (xbar - a) / (s / sqrt(n))
+    p_left <- pt(tstat_L, df = df)
+    rej_left <- p_left < alpha_bc
+
+    tstat_R <- (xbar - b) / (s / sqrt(n))
+    p_right <- 1 - pt(tstat_R, df = df)
+    rej_right <- p_right < alpha_bc
+
+    rej_bonf <- rej_left | rej_right
+
+    data.frame(mu = mu_true,
+               rej_pointwise = rej_pw,
+               rej_bonf = rej_bonf)
+  })
+
+  df_out <- do.call(rbind, out)
+  summary_df <- df_out %>%
+    group_by(mu) %>%
+    summarize(
+      rejection_rate_pointwise = mean(rej_pointwise),
+      rejection_rate_bonf = mean(rej_bonf),
+      .groups = "drop"
+    )
+
+  # restrict to [a,b]
+  interior <- summary_df %>% filter(mu >= a & mu <= b)
+
+  # sizes
+  size_pw <- mean(interior$rejection_rate_pointwise)
+  size_bonf <- mean(interior$rejection_rate_bonf)
+  max_pw <- max(interior$rejection_rate_pointwise)
+  max_bonf <- max(interior$rejection_rate_bonf)
+
+  return(list(
+    summary = summary_df,
+    size_pw = size_pw, size_bonf = size_bonf,
+    max_pw = max_pw, max_bonf = max_bonf
+  ))
+}
+
+# --- Run for multiple n ---
+n_values <- c(5, 10, 20, 50, 200)
+R <- 5000
+a <- 0; b <- 1
+
+results <- lapply(n_values, function(n) {
+  sim <- simulate_test(n = n, a = a, b = b, R = R)
+  data.frame(
+    n = n,
+    avg_size_pw = sim$size_pw,
+    avg_size_bonf = sim$size_bonf,
+    max_size_pw = sim$max_pw,
+    max_size_bonf = sim$max_bonf
+  )
+})
+
+results_df <- bind_rows(results)
+print(results_df)
+
+# --- Plot max rejection rate vs n ---
+results_long <- results_df %>%
+  select(n, max_size_pw, max_size_bonf) %>%
+  tidyr::pivot_longer(cols = starts_with("max_size"),
+                      names_to = "Method", values_to = "MaxRej") %>%
+  mutate(Method = ifelse(Method == "max_size_pw", "Pointwise", "Bonferroni"))
+
+ggplot(results_long, aes(x = n, y = MaxRej, color = Method)) +
+  geom_line() + geom_point(size = 2) +
+  geom_hline(yintercept = 0.05, linetype = "dotted") +
+  labs(y = "Max rejection rate inside [a,b]", x = "Sample size n",
+       title = "Empirical size vs n") +
+  theme_minimal()
+
+# --- Add SE and CI for error bars ---
+results_long <- results_df %>%
+  select(n, max_size_pw, max_size_bonf) %>%
+  tidyr::pivot_longer(cols = starts_with("max_size"),
+                      names_to = "Method", values_to = "MaxRej") %>%
+  mutate(Method = ifelse(Method == "max_size_pw", "Pointwise", "Bonferroni"),
+         n = factor(n)) %>%
+  # compute SE (binomial approx) and 95% CI
+  mutate(
+    SE = sqrt(MaxRej * (1 - MaxRej) / R),
+    CI_lower = pmax(MaxRej - 1.96 * SE, 0),
+    CI_upper = pmin(MaxRej + 1.96 * SE, 1)
+  )
+
+# --- Plot with error bars ---
+ggplot(results_long, aes(x = n, y = MaxRej, color = Method, group = Method)) +
+  geom_line(linewidth = 1.2, aes(group = Method)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = CI_lower, ymax = CI_upper), width = 0.15, linewidth = 0.8) +
+  geom_hline(yintercept = 0.05, linetype = "dotted") +
+  labs(y = "Max rejection rate inside [a,b]", x = "Sample size n") +
+  scale_color_manual(values = c("Pointwise" = "black", "Bonferroni" = "grey60")) +
+  #scale_y_continuous(
+  #  limits = c(0, 0.06),
+  #  breaks = c(0, 0.06, 0.05)  # force 0.05 to appear
+
+  scale_y_continuous(
+    limits = c(0, 0.06),
+    breaks = seq(0, 0.06, 0.01)
+  ) +
+  theme_minimal(base_size = 16) +
+  theme(
+    plot.title = element_text(size = 20, face = "bold", hjust = 0.5),
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 16),
+    legend.title = element_text(size = 16),
+    legend.text = element_text(size = 16)
+  )
