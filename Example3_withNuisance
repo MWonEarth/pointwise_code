@@ -1,0 +1,697 @@
+#################################################################################
+############## compare F-interval with chi-square interval (test around phi MLE)
+#################################################################################
+
+# Define parameters
+# Model: Y = psi * phi * x + psi * phi^2 + epsilon
+# psi: parameter of interest
+# phi: nuisance parameter
+n_values <- c(5, 15, 30, 50, 100, 200)  # Different sample sizes
+sigma <- 1  # Standard deviation of noise
+psi_0 <- 1  # Null value for psi
+phi_0 <- 2  # Null value for phi
+alpha <- 0.05  # Significance level
+alpha_new <- 1 - pchisq(qchisq(1 - alpha, df = 1), df = 2)  # Adjusted alpha for LRT
+# In this modified version of Notebook, the test phi values are chosen in the range of MLE +- 3/sqrt(n)
+# (instead of from a fixed interval (1.9, 2.1))
+
+# Function to generate data based on the model
+generate_data <- function(psi, phi, sigma) {
+  x <- rnorm(n, mean = 0, sd = 1)
+  epsilon <- rnorm(length(x), mean = 0, sd = sigma)
+  y <- psi * phi * x + psi * phi^2 + epsilon
+  # Return a list containing x, y, and epsilon
+  return(list(x = x, y = y, epsilon = epsilon))
+}
+
+# Function to estimate psi and phi using OLS
+estimate_parameters <- function(x, y) {
+  model <- lm(y ~ I(x))  # Linear model
+  beta_1 <- coef(model)[2]  # Coefficient of x
+  beta_0 <- coef(model)[1]  # Intercept
+  phi_hat <- beta_0 / beta_1  # Estimate phi
+  psi_hat <- beta_1 / phi_hat  # Estimate psi
+  return(c(psi_hat, phi_hat))
+}
+
+# Function to calculate the likelihood
+calculate_rss <- function(y, x, psi, phi) {
+  y_pred <- psi * phi * x + psi * phi^2  # Model predictions
+  rss <- sum((y - y_pred)^2)  # Residual sum of squares (RSS)
+  return(rss)
+}
+
+# Function to merge intervals
+merge_intervals <- function(intervals) {
+  # Remove NA intervals
+  valid_intervals <- intervals[!sapply(intervals, function(x) all(is.na(x)))]
+  # Return NA if no valid intervals remain
+  if (length(valid_intervals) == 0) {
+    cat("No valid intervals remaining.\n")
+    return(NA)
+  }
+
+  # Sort intervals by their lower bound
+  # Handle cases where valid_intervals may be empty or contain only NA
+  if (length(valid_intervals) > 0 && !all(is.na(valid_intervals))) {
+    valid_intervals <- valid_intervals[order(sapply(valid_intervals, `[`, 1))]
+  }
+
+  # Initialize merged intervals list
+  # Handle case where valid_intervals may be empty
+  if (length(valid_intervals) > 0) {
+    merged <- list(valid_intervals[[1]])
+  } else {
+    return(NA) # Return NA if no valid intervals to merge
+  }
+
+  # Merge overlapping or adjacent intervals
+  # Iterate only if there are intervals to merge
+  if (length(valid_intervals) > 1) {
+    for (i in 2:length(valid_intervals)) {
+      last_interval <- merged[[length(merged)]]
+      current_interval <- valid_intervals[[i]]
+
+      # Check for overlap or adjacency
+      if (last_interval[2] >= current_interval[1]) {
+        # Merge intervals
+        merged[[length(merged)]] <- c(last_interval[1], max(last_interval[2], current_interval[2]))
+      } else {
+        # Append non-overlapping interval
+        merged <- append(merged, list(current_interval))
+      }
+    }
+  }
+  return(merged)
+}
+
+# Function to check if psi_0 is in union of intervals
+psi_in_union <- function(intervals, psi_0) {
+  # Check if intervals is NULL or NA
+  if (is.null(intervals) || all(is.na(intervals))) {
+    return(0)  # Return 0 if intervals is empty or NA
+  }
+
+  # If intervals is not empty, proceed as before
+  for (i in 1:length(intervals)) { # Change from nrow to length to handle list
+    interval <- intervals[[i]] # Extract the interval from the list
+    if (psi_0 >= interval[1] && psi_0 <= interval[2]) {
+      return(1)
+    }
+  }
+  return(0)
+}
+
+# Set the number of simulations
+n_simulations <- 10000
+
+set.seed(123)  # For reproducibility
+
+# Store results
+results <- data.frame(n = integer(), method = character(), proportion = numeric())
+
+# Loop through each sample size
+for (n in n_values) {
+
+  f_proportions <- numeric(n_simulations)
+  chi_proportions <- numeric(n_simulations)
+
+  for (sim in 1:n_simulations) {
+    # Generate new data
+    data_output <- generate_data(psi_0, phi_0, sigma)
+    y_values <- data_output$y
+    x_values <- data_output$x
+
+    # Estimate MLEs for psi and phi
+    params_hat <- estimate_parameters(x_values, y_values)
+    psi_hat <- params_hat[1]
+    phi_hat <- params_hat[2]
+
+    # Calculate RSS under MLEs
+    rss_mle <- calculate_rss(y_values, x_values, psi_hat, phi_hat)
+
+    # F-based intervals
+    critical_value_f <- qf(1 - alpha_new, df1 = 2, df2 = n - 2)
+    f_intervals_sim <- list()
+
+    for (phi in phi_hat + 1/sqrt(n)*seq(-5,5,length.out=50)) {
+      A <- phi^2 * sum((x_values + phi)^2)
+      B <- -2 * phi * sum((x_values + phi) * y_values)
+      C <- sum((y_values)^2) - ((2 * critical_value_f) / (n - 2) + 1) * rss_mle
+      discriminant <- B^2 - 4 * A * C
+      if (discriminant > 0) {
+        psi_0_1 <- (-B - sqrt(discriminant)) / (2 * A)
+        psi_0_2 <- (-B + sqrt(discriminant)) / (2 * A)
+        f_intervals_sim[[as.character(phi)]] <- c(psi_0_1, psi_0_2)
+      }
+    }
+    f_union_intervals <- merge_intervals(f_intervals_sim)
+    f_proportions[sim] <- psi_in_union(f_union_intervals, psi_0)
+
+    # Chi-square intervals
+    critical_value_chi <- qchisq(1 - alpha, df = 1) ## changed
+    chi_intervals_sim <- list()
+
+    for (phi in phi_hat + 1/sqrt(n)*seq(-5,5,length.out=50)) {
+      A <- phi^2 * sum((x_values + phi)^2)
+      B <- -2 * phi * sum((x_values + phi) * y_values)
+      C <- sum((y_values)^2) - exp(critical_value_chi / n) * rss_mle
+      discriminant <- B^2 - 4 * A * C
+      if (discriminant > 0) {
+        psi_0_1 <- (-B - sqrt(discriminant)) / (2 * A)
+        psi_0_2 <- (-B + sqrt(discriminant)) / (2 * A)
+        chi_intervals_sim[[as.character(phi)]] <- c(psi_0_1, psi_0_2)
+      }
+    }
+    chi_union_intervals <- merge_intervals(chi_intervals_sim)
+    chi_proportions[sim] <- psi_in_union(chi_union_intervals, psi_0)
+  }
+
+  # Store results
+  results <- rbind(
+    results,
+    data.frame(n = n, method = "Finite-sample F test", proportion = mean(f_proportions)),
+    data.frame(n = n, method = "Likelihood ratio test", proportion = mean(chi_proportions))
+  )
+}
+
+results
+
+alpha_new
+
+save(results, file='nuisance_F_chi.rdata')
+
+# load saved data
+load_data <- FALSE ## CHECK THIS
+if (load_data) {
+  load('nuisance_F_chi.rdata')
+}
+
+# Install and load tidyverse if not already installed
+if (!requireNamespace("tidyverse", quietly = TRUE)) {
+  install.packages("tidyverse")
+}
+library(tidyverse)
+
+
+# Summarize results with mean and confidence intervals
+results_summary <- results %>%
+  group_by(n, method) %>%
+  summarise(
+    proportion = mean(proportion),
+    lower = proportion - 1.96 * sqrt((proportion * (1 - proportion)) / n_simulations),
+    upper = proportion + 1.96 * sqrt((proportion * (1 - proportion)) / n_simulations),
+    .groups = "drop"  # Override the grouping warning
+  )
+
+
+
+#--------- Fig6_4 --------------
+
+g <- ggplot(results_summary,
+            aes(x = factor(n), y = proportion,
+                alpha = method, color = method, group = method)) +
+  geom_line(linewidth = .7) +
+  geom_point(size = 2) +
+  geom_errorbar(aes(ymin = lower, ymax = upper),
+                width = 0.2, linewidth = 0.6) +
+  geom_hline(yintercept = 0.95, linetype = "dotted",
+             color = "black", linewidth = 0.8) +
+
+  scale_color_manual(values = c(
+    "Likelihood ratio test" = "red",
+    "Pointwise Finite-sample F test" = "black"
+  )) +
+
+  scale_alpha_manual(values = c(
+    "Likelihood ratio test" = 0.35,
+    "Pointwise Finite-sample F test" = 1
+  )) +
+
+  labs(
+    x = "Sample Size (n)",
+    y = "Proportion",
+    color = "Method",
+    alpha = "Method"
+  ) +
+
+  theme_classic() +
+  theme(
+    legend.position = "right",
+    text = element_text(size = 18),
+    axis.text = element_text(size = 18),
+    axis.title = element_text(size = 18),
+    legend.text = element_text(size = 18),
+    legend.title = element_text(size = 18)
+  )
+
+g
+# Make plots wider and shorter
+options(repr.plot.width = 16, repr.plot.height = 3)
+
+
+
+
+
+
+
+##########################################
+######## ComparingPowers (test around MLE)
+##########################################
+
+# Define parameters
+n_values <- c(5, 10)  # Sample size
+sigma <- 1  # Standard deviation of noise
+psi_0 <- 1  # Null value for psi
+phi_0 <- 2  # true value for phi
+alpha <- 0.05  # Significance level
+alpha_new <- 1 - pchisq(qchisq(1 - alpha, df = 1), df = 2)  # Adjusted alpha for LRT
+
+# Function to generate data based on the model
+generate_data <- function(psi, phi, sigma) {
+  x <- rnorm(n, mean = 0, sd = 1)  # Explanatory variable
+  epsilon <- rnorm(length(x), mean = 0, sd = sigma)  # Random noise
+  y <- psi * phi * x + psi * phi^2 + epsilon  # Model for y
+  return(list(x=x, y=y))
+}
+
+# Function to estimate psi and phi using OLS
+estimate_parameters <- function(x, y) {
+  model <- lm(y ~ I(x))  # Linear model
+  beta_1 <- coef(model)[2]  # Coefficient of x
+  beta_0 <- coef(model)[1]  # Intercept
+  phi_hat <- beta_0 / beta_1  # Estimate phi
+  psi_hat <- beta_1 / phi_hat  # Estimate psi
+  return(c(psi_hat, phi_hat))
+}
+
+# Calculate LRT statistic and F-statistic for each simulation
+calculate_statistics <- function(y, x, psi_0, phi_proxy_variations, n) {
+  stat_lrt <- numeric(length(phi_proxy_variations))
+  stat_f <- numeric(length(phi_proxy_variations))
+
+  # Alternative model (estimate parameters once)
+  estimates <- estimate_parameters(x, y)
+  psi_hat <- estimates[1]
+  phi_hat <- estimates[2]
+  y_alt <- psi_hat * phi_hat * x + psi_hat * phi_hat^2
+  rss_alt <- sum((y - y_alt)^2)  # Residual sum of squares for alternative model
+
+  phi_values <- phi_hat + phi_proxy_variations
+
+  for (i in seq_along(phi_values)) {
+    # Null model
+    phi_0 <- phi_values[i] # proxy test value for phi
+    y_null <- psi_0 * phi_0 * x + psi_0 * phi_0^2
+    rss_null <- sum((y - y_null)^2)  # Residual sum of squares for null model
+
+    # LRT statistic
+    stat_lrt[i] <- n * log(rss_null / rss_alt)
+
+    # F-statistic
+    q <- 2  # Difference in parameters
+    p <- 2  # Parameters in the alternative model
+    stat_f[i] <- ((rss_null - rss_alt) / q) / (rss_alt / (n - p))
+  }
+
+  return(list(lrt_stat = min(stat_lrt), f_stat = min(stat_f)))
+}
+
+set.seed(123)
+
+psi_alt <- 1.5  # Alternative value for psi
+
+# Set the number of simulations
+n_sim <- 1000
+
+n <- 5 # sample size
+
+# Store the rejection results for each simulation for both tests
+lrt_rejections <- numeric(n_sim)
+f_stat_rejections <- numeric(n_sim)
+
+# Simulate the process under the alternative hypothesis
+for (sim in 1:n_sim) {
+  # Generate data under the alternative hypothesis
+  data_output <- generate_data(psi_alt, phi_0, sigma)
+  y <- data_output$y
+  x <- data_output$x
+
+  phi_proxy_variations <- 1/sqrt(n) * seq(-5, 5, length.out=50)
+
+  # Test if null hypothesis (psi = psi_0) is rejected using LRT and F-statistic
+  stats <- calculate_statistics(y, x, psi_0, phi_proxy_variations, n)
+  lrt_stat <- stats$lrt_stat
+  f_stat <- stats$f_stat
+
+  # Rejection based on LRT
+  lrt_rejections[sim] <- (lrt_stat > qchisq(1-alpha, df=1))
+
+  # Rejection based on F-statistic
+  f_stat_rejections[sim] <- (f_stat > qf(1-alpha_new, df1=2, df2=n-2))
+}
+
+# Calculate the power of the tests
+lrt_power <- mean(lrt_rejections)
+f_stat_power <- mean(f_stat_rejections)
+
+cat("Power for LRT: ", lrt_power, "\n")
+cat("Power for pointwise F-test: ", f_stat_power, "\n")
+
+#"""# repeated experiments #"""
+
+# Set the number of simulations
+n_sim <- 10000
+
+# Define ranges for parameters
+psi_alt_values <- seq(0.5, 1.5, by = 0.5)  # Range of psi values under alternative
+phi_values <- seq(1, 3, by = .5)  # Range of phi values
+
+results <- list()
+
+for (n in n_values) {
+
+  # Initialize matrices to store power results
+  lrt_power_matrix <- matrix(0, nrow = length(psi_alt_values), ncol = length(phi_values))
+  f_stat_power_matrix <- matrix(0, nrow = length(psi_alt_values), ncol = length(phi_values))
+
+  # Estimate the power for each combination of psi_alt and phi
+  for (psi_idx in seq_along(psi_alt_values)) {
+    psi_alt <- psi_alt_values[psi_idx]
+
+    for (phi_idx in seq_along(phi_values)) {
+      phi_current <- phi_values[phi_idx]
+
+      # Store rejection results for this combination
+      lrt_rejections <- numeric(n_sim)
+      f_stat_rejections <- numeric(n_sim)
+
+      for (sim in 1:n_sim) {
+        # Generate data under the alternative hypothesis
+        data_output <- generate_data(psi_alt, phi_current, sigma)
+        y <- data_output$y
+        x <- data_output$x
+
+        phi_proxy_variations <- 1/sqrt(n) * seq(-10, 10, length.out=100)
+
+        # Calculate statistics once for both tests
+        stats <- calculate_statistics(y, x, psi_0, phi_proxy_variations, n)
+        lrt_stat <- stats$lrt_stat
+        f_stat <- stats$f_stat
+
+        # Rejection based on LRT
+        lrt_rejections[sim] <- (lrt_stat > qchisq(1-alpha, df=1))
+
+        # Rejection based on F-statistic
+        f_stat_rejections[sim] <- (f_stat > qf(1-alpha_new, df1=2, df2=n-2))
+      }
+
+      # Calculate power for this combination
+      lrt_power_matrix[psi_idx, phi_idx] <- mean(lrt_rejections)
+      f_stat_power_matrix[psi_idx, phi_idx] <- mean(f_stat_rejections)
+    }
+  }
+
+  results[[as.character(n)]] <- list(f = f_stat_power_matrix, lrt = lrt_power_matrix)
+}
+
+save(results, file="power_nuisance.rdata")
+
+results
+
+if (!requireNamespace("reshape2", quietly = TRUE)) {
+  install.packages("reshape2")
+}
+library(reshape2)
+
+library(reshape2)
+
+# Function to transform the matrices into a long format data frame
+transform_results <- function(results, psi_alt_values, phi_values) {
+  long_df <- data.frame()
+
+  for (n_val_str in names(results)) {
+    n_val <- as.numeric(n_val_str)
+    for (method in names(results[[n_val_str]])) {
+      power_matrix <- results[[n_val_str]][[method]]
+      temp_df <- melt(power_matrix)
+      colnames(temp_df) <- c("psi_index", "phi_index", "Power")
+      temp_df$n <- n_val
+      temp_df$method <- method
+      temp_df$psi <- psi_alt_values[temp_df$psi_index]
+      temp_df$phi <- phi_values[temp_df$phi_index]
+      long_df <- rbind(long_df, temp_df)
+    }
+  }
+  return(long_df)
+}
+
+# Transform the results
+power_long_df <- transform_results(results, psi_alt_values, phi_values)
+
+library(ggplot2)
+
+# Calculate the half width of the error bars
+power_long_df$se <- sqrt(power_long_df$Power * (1 - power_long_df$Power) / n_sim)
+
+
+#---------- Fig6_5 ----------------------
+
+gpower <- ggplot(power_long_df,
+                 aes(x = phi, y = Power, color = method)) +
+  geom_line(aes(alpha = method), linewidth = 0.4) +
+  geom_hline(yintercept = 0.05, linetype = "dashed") +
+  geom_errorbar(aes(ymin = Power - 1.96*se,
+                    ymax = Power + 1.96*se,
+                    alpha = method),
+                width = 0.1) +
+  scale_y_continuous(limits = c(0, 0.7)) +
+  facet_grid(n ~ psi,
+             labeller = label_bquote(rows = "n" == .(n),
+                                     cols = psi == .(psi))) +
+
+  # NEW: COLOR SCALE
+  scale_color_manual(
+    name = "Method",
+    values = c("f" = "black",
+               "lrt" = "red"),
+    labels = c("f" = "F-test",
+               "lrt" = "LRT")
+  ) +
+
+  scale_alpha_manual(
+    values = c("f" = 1,
+               "lrt" = 0.35),
+    labels = c("f" = "F-test",
+               "lrt" = "LRT")
+  ) +
+
+  labs(
+    x = expression(phi),
+    y = "Power",
+    color = "Method",
+    alpha = "Method"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "right",
+    text = element_text(size = 18),
+    axis.title.x = element_text(size = 18),
+    axis.title.y = element_text(size = 18),
+    axis.text.x  = element_text(size = 18),
+    axis.text.y  = element_text(size = 18),
+    legend.text  = element_text(size = 18),
+    legend.title = element_text(size = 18)
+  )
+
+gpower
+
+# adjust plots width and height
+options(repr.plot.width = 10, repr.plot.height = 4)
+
+
+
+#########################################################
+###### Comparing with Bootstrap
+#########################################################
+
+library(ggplot2)
+
+# Set parameters
+n_sim <- 1000
+sample_sizes <- c(5, 15, 30, 50, 100, 200)
+sigma <- 1
+theta_0 <- 1
+phi_0 <- 2
+alpha <- 0.05
+alpha_new <- 1 - pchisq(qchisq(1 - alpha, df = 1), df = 2)
+phi_values <- seq(1.9, 2.1, by = 0.01)
+n_bootstrap <- 50
+
+# Data generation
+generate_data <- function(theta, phi, x, sigma) {
+  epsilon <- rnorm(length(x), mean = 0, sd = sigma)
+  y <- theta * phi * x + theta * phi^2 + epsilon
+  return(y)
+}
+
+# Parameter estimation
+estimate_parameters <- function(x, y) {
+  model <- lm(y ~ I(x))
+  beta_1 <- coef(model)[2]
+  beta_0 <- coef(model)[1]
+  phi_hat <- beta_0 / beta_1
+  theta_hat <- beta_1 / phi_hat
+  return(c(theta_hat, phi_hat))
+}
+
+# F-statistic calculation
+calculate_f_statistic <- function(y, x, theta_0, phi_0, n) {
+  y_null <- theta_0 * phi_0 * x + theta_0 * phi_0^2
+  rss_null <- sum((y - y_null)^2)
+
+  estimates <- estimate_parameters(x, y)
+  theta_hat <- estimates[1]
+  phi_hat <- estimates[2]
+  y_alt <- theta_hat * phi_hat * x + theta_hat * phi_hat^2
+  rss_alt <- sum((y - y_alt)^2)
+
+  q <- 2
+  p <- 2
+  f_stat <- ((rss_null - rss_alt) / q) / (rss_alt / (n - p))
+
+  return(f_stat)
+}
+
+# Bootstrap LRT for one sample
+bootstrap_test <- function(x, y, theta_0, phi_values, alpha, B = 50) {
+  n <- length(x)
+
+  loglik_null_obs <- sapply(phi_values, function(phi) {
+    mu_null <- theta_0 * phi * x + theta_0 * phi^2
+    -sum((y - mu_null)^2)
+  })
+  max_loglik_null_obs <- max(loglik_null_obs)
+
+  estimates <- estimate_parameters(x, y)
+  mu_alt <- estimates[1] * estimates[2] * x + estimates[1] * estimates[2]^2
+  loglik_alt_obs <- -sum((y - mu_alt)^2)
+
+  lambda_obs <- loglik_null_obs - loglik_alt_obs
+  lambda_obs_max <- max(lambda_obs)
+
+  lambda_boot <- numeric(B)
+  for (b in 1:B) {
+    eps_boot <- sample(y - mu_alt, replace = TRUE)
+    y_boot <- mu_alt + eps_boot
+
+    loglik_null_boot <- sapply(phi_values, function(phi) {
+      mu_null_b <- theta_0 * phi * x + theta_0 * phi^2
+      -sum((y_boot - mu_null_b)^2)
+    })
+    max_loglik_null_boot <- max(loglik_null_boot)
+
+    estimates_boot <- estimate_parameters(x, y_boot)
+    mu_alt_b <- estimates_boot[1] * estimates_boot[2] * x + estimates_boot[1] * estimates_boot[2]^2
+    loglik_alt_boot <- -sum((y_boot - mu_alt_b)^2)
+
+    lambda_boot[b] <- max_loglik_null_boot - loglik_alt_boot
+  }
+
+  p_boot <- mean(lambda_boot >= lambda_obs_max)
+  return(p_boot < alpha)
+}
+
+# Initialize results
+results <- data.frame()
+
+# Run simulation
+for (n in sample_sizes) {
+  f_rejections <- numeric(n_sim)
+  boot_rejections <- numeric(n_sim)
+
+  for (sim in 1:n_sim) {
+    x <- rnorm(n)
+    y <- generate_data(theta_0, phi_0, x, sigma)
+
+    # F-test for each phi
+    p_values_f <- numeric(length(phi_values))
+    for (i in seq_along(phi_values)) {
+      f_stat <- calculate_f_statistic(y, x, theta_0, phi_values[i], n)
+      p_values_f[i] <- 1 - pf(f_stat, df1 = 2, df2 = n - 2)
+    }
+    f_rejections[sim] <- all(p_values_f < alpha_new)
+
+    # Bootstrap test
+    boot_rejections[sim] <- bootstrap_test(x, y, theta_0, phi_values, alpha, n_bootstrap)
+  }
+
+  # Confidence intervals
+  calc_ci <- function(r) 1.96 * sqrt(r * (1 - r) / n_sim)
+
+  f_rate <- mean(f_rejections)
+  boot_rate <- mean(boot_rejections)
+
+  results <- rbind(results, data.frame(
+    SampleSize = n,
+    Method = "F-statistic",
+    RejectionRate = f_rate,
+    LowerCI = f_rate - calc_ci(f_rate),
+    UpperCI = f_rate + calc_ci(f_rate)
+  ))
+
+  results <- rbind(results, data.frame(
+    SampleSize = n,
+    Method = "Bootstrap",
+    RejectionRate = boot_rate,
+    LowerCI = boot_rate - calc_ci(boot_rate),
+    UpperCI = boot_rate + calc_ci(boot_rate)
+  ))
+}
+
+# ------------ Fig6_6 -------------------------
+
+results$SampleSize <- factor(results$SampleSize, levels = sample_sizes)
+
+ggplot(results, aes(x = SampleSize, y = RejectionRate, color = Method, group = Method)) +
+  geom_line(linewidth = 1, alpha = 0.8) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = LowerCI, ymax = UpperCI),
+                width = 0.15, linewidth = 0.6) +
+  geom_hline(yintercept = 0.05, linetype = "dashed",
+             color = "blue", linewidth = 0.8) +
+  annotate("text",
+           x = length(sample_sizes),      # last category
+           y = 0.05,
+           label = "0.05",
+           vjust = -0.7,
+           color = "black",
+           size = 6) +
+  labs(
+    title = "Rejection Rates of Bootstrap and F-statistic Test \n with Error Bars",
+    x = "Sample Size (n)",
+    y = "Rejection Rate",
+    color = "Method"
+  ) +
+
+  scale_x_discrete(drop = FALSE) +
+scale_y_continuous(
+    limits = c(0, 0.25),              # widen vertical space
+    breaks = seq(0, 0.25, by = 0.05)  # more ticks (0.00, 0.05, 0.10, ...)
+) +
+scale_color_manual(values = c("Bootstrap" = "red",
+                              "F-statistic" = "black")) +
+
+
+  theme_minimal() +
+  theme(
+    legend.position = "right",
+    text = element_text(size = 18),
+    plot.title = element_text(size = 17, face = "bold", hjust = 0.5),
+    axis.title.x = element_text(size = 17),
+    axis.title.y = element_text(size = 17),
+    axis.text.x = element_text(size = 17),
+    axis.text.y = element_text(size = 17),
+    legend.text = element_text(size = 16),
+    legend.title = element_text(size = 17)
+  )
