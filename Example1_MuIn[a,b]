@@ -265,14 +265,15 @@ results_long <- results_df %>%
     CI_upper = pmin(MaxRej + 1.96 * SE, 1)
   )
 
-# --- Plot with error bars ---
+
+# --- Plot with error bars (Fig6_1)---
 ggplot(results_long, aes(x = n, y = MaxRej, color = Method, group = Method)) +
   geom_line(linewidth = 1.2, aes(group = Method)) +
   geom_point(size = 3) +
   geom_errorbar(aes(ymin = CI_lower, ymax = CI_upper), width = 0.15, linewidth = 0.8) +
   geom_hline(yintercept = 0.05, linetype = "dotted") +
   labs(y = "Max rejection rate inside [a,b]", x = "Sample size n") +
-  scale_color_manual(values = c("Pointwise" = "black", "Bonferroni" = "grey60")) +
+  scale_color_manual(values = c("Pointwise" = "black", "Bonferroni" = "red")) +
   #scale_y_continuous(
   #  limits = c(0, 0.06),
   #  breaks = c(0, 0.06, 0.05)  # force 0.05 to appear
@@ -289,3 +290,28 @@ ggplot(results_long, aes(x = n, y = MaxRej, color = Method, group = Method)) +
     legend.title = element_text(size = 16),
     legend.text = element_text(size = 16)
   )
+
+# --- plot with error bars (Fig6_2) ---
+p <- ggplot(sim$summary, aes(x = mu)) +
+  geom_line(aes(y = rejection_rate_pointwise, color = "Pointwise"), linewidth = 1.2) +
+  geom_errorbar(aes(ymin = lower_pw, ymax = upper_pw, color = "Pointwise"), width = 0.02, alpha = 0.4) +
+  geom_line(aes(y = rejection_rate_bonf, color = "Bonferroni"), linewidth = 1.2) +
+  geom_errorbar(aes(ymin = lower_bonf, ymax = upper_bonf, color = "Bonferroni"), width = 0.02, alpha = 0.4) +
+  geom_vline(xintercept = c(a, b), linetype = "dashed") +
+  geom_hline(yintercept = 0.05, linetype = "dotted", color = "black") +
+  labs(x = expression(mu), y = "Rejection rate",
+       color = "Method") +
+  scale_color_manual(values = c("Pointwise" = "black", "Bonferroni" = "red")) +
+  scale_y_continuous(
+    limits = c(0, 0.055),
+    breaks = seq(0, 0.055, 0.01)
+  ) +
+  theme_minimal(base_size = 16) +
+  theme(
+    plot.title = element_text(size = 20, face = "bold", hjust = 0.5),
+    axis.title = element_text(size = 18),
+    axis.text = element_text(size = 16),
+    legend.title = element_text(size = 16),
+    legend.text = element_text(size = 16)
+  )
+  p
