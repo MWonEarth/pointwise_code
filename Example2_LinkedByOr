@@ -1,0 +1,139 @@
+# F test at a fixed theta0 = (beta1, beta2),
+# with intercept estimated freely
+RSS_point <- function(X, Y, theta0) {
+  # Restricted fit: beta1,beta2 fixed, intercept free
+  offset_term <- X %*% theta0
+  fit_restricted <- lm(Y ~ 1 + offset(offset_term))
+  RSS0 <- sum(resid(fit_restricted)^2)
+  return(RSS0)
+}
+
+# Composite test using proxy boundary points
+composite_test <- function(X, Y, alpha, mhalf) {
+  n <- nrow(X)
+  fit_full <- lm(Y ~ X)
+  beta_hat <- coef(fit_full)[-1]   # drop intercept, keep slopes only
+  RSS_full <- sum(resid(fit_full)^2)
+
+  # if at least one of the OLS estimates (for beta_1 and beta_2) is nonpositive, fail to reject H0
+  if (beta_hat[1] <= 0 || beta_hat[2] <= 0) {
+    return(FALSE)
+  }
+
+  # Proxy boundary points along axes
+  theta1_grid <- seq(0, 2*beta_hat[1], length.out=mhalf)
+  theta2_grid <- seq(0, 2*beta_hat[2], length.out=mhalf)
+  boundary_points <- rbind(
+    cbind(theta1_grid, 0),
+    cbind(0, theta2_grid)
+  )
+
+  # Adjusted critical value
+  alpha_prime <- 1 - pchisq(qchisq(1 - 2*alpha, df=1), df=2)
+  crit <- qf(1 - alpha_prime, df1=2, df=n-3)
+
+  # Test each boundary point
+  Fstats <- apply(boundary_points, 1, function(th0) { (RSS_point(X, Y, th0) / RSS_full - 1) * (n-3)/2 })
+  reject_each <- (Fstats > crit)
+
+  reject_all <- all(reject_each)
+  return(reject_all)
+}
+
+# Simulation
+simulate_rejection_rate <- function(n, beta_true, beta0_true=0, sigma=1, reps, mhalf, alpha) {
+  rejects <- logical(reps)
+  for (i in 1:reps) {
+    X <- matrix(rnorm(n*2), ncol=2)
+    Y <- beta0_true + X %*% beta_true + rnorm(n, sd=sigma)
+    rejects[i] <- composite_test(X, Y, alpha, mhalf)
+  }
+  mean(rejects)
+}
+
+nreps <- 10000
+ns <- c(5, 10, 20, 50, 100)
+
+set.seed(123)
+
+# --------------------------------
+# Run simulations for different sample sizes, 10 test points
+# --------------------------------
+rates_m5 <- sapply(ns, function(n) simulate_rejection_rate(n, beta_true=c(1,0), reps=nreps, mhalf=5, alpha=0.05))
+
+rates_m5
+
+set.seed(456)
+
+# --------------------------------
+# Run simulations for different sample sizes, 100 test points
+# --------------------------------
+rates_m50 <- sapply(ns, function(n) simulate_rejection_rate(n, beta_true=c(1,0), reps=nreps, mhalf=50, alpha=0.05))
+
+rates_m50
+
+library(dplyr)
+
+# Make plots wider and shorter
+options(repr.plot.width = 10, repr.plot.height = 5)
+
+# Build tidy data frame for ggplot
+df <- data.frame(
+  n     = rep(ns, 2),
+  rate  = c(rates_m5, rates_m50),
+  group = rep(c("m = 10", "m = 100"), each = length(ns))
+) %>%
+  mutate(percentage=100*rate, se = 100*sqrt(rate*(1-rate)/nreps), me = 1.96*se) %>%
+  mutate(
+    lo = pmax(0, rate - 1.96 * se),
+    hi = pmin(1, rate + 1.96 * se)
+  )
+
+df %>% select(c(percentage, me)) %>% as.matrix %>% t
+
+## Estimate rejection rates for other values for the true parameter
+nreps <- 10000
+ns <- c(5, 10, 20, 50, 100)
+
+set.seed(789)
+
+# --------------------------------
+# Run simulations for different sample sizes, 10 test points
+# --------------------------------
+rates_00 <- sapply(ns, function(n) simulate_rejection_rate(n, beta_true=c(0,0), reps=nreps, mhalf=5, alpha=0.05))
+rates_11 <- sapply(ns, function(n) simulate_rejection_rate(n, beta_true=c(1,1), reps=nreps, mhalf=5, alpha=0.05))
+
+save(rates_m5, rates_m50, rates_00, rates_11, file="rejection_rates_or.rdata")
+
+df_power <- data.frame(
+  n     = rep(ns, 3),
+  rate  = c(rates_m5, rates_00, rates_11),
+  true_parameter = rep(c("(1,0)", "(0,0)", "(1,1)"), each = length(ns))
+) %>%
+  mutate(se = sqrt(rate*(1-rate)/nreps)) %>%
+  mutate(
+    lo = pmax(0, rate - 1.96 * se),
+    hi = pmin(1, rate + 1.96 * se)
+  )
+df_power
+
+library(ggplot2)
+#------- fig6_3 ----------
+
+gpower <- ggplot(df_power, aes(x = factor(n), y = rate, group = true_parameter, linetype = true_parameter, color = true_parameter)) +
+  geom_line() +
+  geom_errorbar(aes(ymin = lo, ymax = hi), width = 0.15, size = 0.8) +
+  geom_hline(yintercept = 0.05, linetype = "dotted") +
+  scale_linetype_manual(name = "True parameter", values = c("(1,0)" = "solid", "(0,0)" = "dashed", "(1,1)" = "solid")) +
+  scale_color_manual(name = "True parameter", values = c("(1,0)" = "blue", "(0,0)" = "blue", "(1,1)" = "black")) +
+  labs(x = "Sample Size (n)", y = "Rejection Rate") +
+  expand_limits(y=0) +
+  theme_minimal(base_size = 14) +
+  theme(
+    axis.title = element_text(size = 18),
+    axis.text  = element_text(size = 16),
+    legend.title = element_text(size = 16),
+    legend.text = element_text(size = 16),
+    legend.position = "right"
+  )
+gpower
