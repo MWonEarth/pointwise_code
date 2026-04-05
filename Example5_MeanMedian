@@ -1,0 +1,850 @@
+########### Nonparametric studying ################
+################ testing null: mean = median ###############
+
+
+alpha_new <- function(alpha, d0 = 1, d1 = 2) {
+  cval <- qchisq(1 - alpha, df = d1 - d0)
+  1 - pchisq(cval, df = d1)
+}
+#################
+boot_th_and_h <- function(x, B = 1000,
+                          use_m_out_of_n = FALSE,
+                          m_power = 0.7) {
+  n <- length(x)
+
+  if (!use_m_out_of_n) {
+    m <- n
+  } else {
+    m <- max(10L, floor(n^m_power))
+  }
+
+  idx <- matrix(sample.int(n, size = m * B, replace = TRUE),
+                nrow = m, ncol = B)
+  x_star <- matrix(x[idx], nrow = m, ncol = B)
+
+  means <- colMeans(x_star)
+  meds  <- apply(x_star, 2, median)
+
+  th_star <- cbind(means, meds)
+
+  Sigma_hat <- cov(th_star)
+  if (use_m_out_of_n) {
+    Sigma_hat <- Sigma_hat * (m / n)
+  }
+
+  # ---- h bootstrap, scaled to n-level when m-out-of-n ----
+  h_hat  <- mean(x) - median(x)
+  h_star <- means - meds
+
+  if (use_m_out_of_n) {
+    h_star <- h_hat + sqrt(m / n) * (h_star - h_hat)
+  }
+
+  list(
+    th_hat = c(mean(x), median(x)),
+    Sigma_hat = Sigma_hat,
+    h_hat = h_hat,
+    h_star = h_star,
+    m = m, n = n
+  )
+}
+
+
+#################
+test_pointwise_diag_fast <- function(x, alpha = 0.05,
+                                     delta = function(x) 2 * sd(x) / sqrt(length(x)),
+                                     K = 31,
+                                     B = 1000,
+                                     use_m_out_of_n = FALSE,
+                                     m_power = 0.7,
+                                     ridge = 1e-10) {
+
+  bt <- boot_th_and_h(x, B = B,
+                      use_m_out_of_n = use_m_out_of_n,
+                      m_power = m_power)
+
+  th_hat <- bt$th_hat
+  Sigma_hat <- bt$Sigma_hat
+
+  Sinv <- solve(Sigma_hat + diag(ridge, 2))
+
+  a_new <- alpha_new(alpha, d0 = 1, d1 = 2)
+  q2 <- qchisq(1 - a_new, df = 2)
+
+  delt <- if (is.function(delta)) delta(x) else delta
+  xbar <- th_hat[1]
+  tgrid <- seq(xbar - delt, xbar + delt, length.out = K)
+
+  # D is K x 2 matrix of (mean - t, median - t)
+  D <- cbind(th_hat[1] - tgrid, th_hat[2] - tgrid)
+
+  # quadratic form for each row: d' Sinv d
+  stats <- rowSums((D %*% Sinv) * D)
+
+  list(
+    reject = all(stats > q2),
+    alpha_new = a_new,
+    q = q2,
+    delta_used = delt,
+    use_m_out_of_n = use_m_out_of_n
+  )
+}
+## -----------------------------
+## Distribution generators
+## -----------------------------
+
+# Nulls: mean = median = 0
+
+r_null_t3 <- function(n) rt(n, df = 3)
+
+r_null_contaminated_normal <- function(n) {
+  z <- rnorm(n)
+  big <- rnorm(n, sd = 8)
+  mix <- rbinom(n, 1, 0.10)
+  ifelse(mix == 1, big, z)
+}
+
+r_null_laplace <- function(n, b = 1) {
+  u <- runif(n) - 0.5
+  -b * sign(u) * log(1 - 2 * abs(u))
+}
+
+# Alternatives (mean != median typically)
+
+r_alt_spiky_multimodal <- function(n) {
+  s <- sample(c(-1, 1), size = n, replace = TRUE)
+  s * 2 + rnorm(n, sd = 0.25)
+}
+
+r_alt_shifted_exp <- function(n, delta = 0) {
+  (rexp(n) - 1) + delta
+}
+
+# IMPORTANT: recenter by population mean (not sample mean) for stability
+r_alt_pointmass_exp <- function(n, p0 = 0.30, delta = 0) {
+  u <- runif(n)
+  x <- ifelse(u < p0, 0, rexp(n))
+  x - (1 - p0) + delta
+}
+
+##################
+test_general_h_from_boot <- function(h_star, alpha = 0.05) {
+  L <- as.numeric(quantile(h_star, probs = alpha/2))
+  U <- as.numeric(quantile(h_star, probs = 1 - alpha/2))
+  list(reject = (0 < L) || (0 > U), L = L, U = U)
+}
+####################
+run_size_compare_fast <- function(sample_sizes = c(10,20,40),
+                                  alpha = 0.05,
+                                  nsim = 2000,
+                                  B = 1000,
+                                  K = 61,
+                                  delta = function(x) 2 * sd(x) / sqrt(length(x)),
+                                  use_m_out_of_n = FALSE,
+                                  m_power = 0.7,
+                                  seed = 1) {
+
+  null_list <- list(
+    "t(df=3)" = r_null_t3,
+    "contaminated normal" = r_null_contaminated_normal,
+    "Laplace" = r_null_laplace
+  )
+
+  set.seed(seed)
+  out <- list(); idx <- 1
+
+  for (n in sample_sizes) {
+    for (nm in names(null_list)) {
+      rP <- null_list[[nm]]
+
+      rej_pw <- logical(nsim)
+      rej_h  <- logical(nsim)
+
+      for (i in seq_len(nsim)) {
+        x <- rP(n)
+
+        # one bootstrap draw reused for both methods
+        bt <- boot_th_and_h(x, B = B,
+                            use_m_out_of_n = use_m_out_of_n,
+                            m_power = m_power)
+
+        # pointwise (vectorized)
+        th_hat <- bt$th_hat
+        Sinv <- solve(bt$Sigma_hat + diag(1e-10, 2))
+
+        a_new <- alpha_new(alpha, 1, 2)
+        q2 <- qchisq(1 - a_new, df = 2)
+
+        delt <- if (is.function(delta)) delta(x) else delta
+        tgrid <- seq(th_hat[1] - delt, th_hat[1] + delt, length.out = K)
+        D <- cbind(th_hat[1] - tgrid, th_hat[2] - tgrid)
+        stats <- rowSums((D %*% Sinv) * D)
+        rej_pw[i] <- all(stats > q2)
+
+        # general h test from same bootstrap
+        rej_h[i] <- test_general_h_from_boot(bt$h_star, alpha = alpha)$reject
+      }
+
+      p_pw <- mean(rej_pw); p_h <- mean(rej_h)
+
+      out[[idx]] <- data.frame(
+        Study="Size", n=n, Dist=nm,
+        Method = if (use_m_out_of_n) "Pointwise over t-grid (m-out-of-n)" else "Pointwise over t-grid",
+        RejectRate=p_pw,
+        SE=sqrt(p_pw*(1-p_pw)/nsim),
+        nsim=nsim, B=B, K=K,
+        m_power = if (use_m_out_of_n) m_power else NA_real_
+      ); idx <- idx + 1
+
+      out[[idx]] <- data.frame(
+        Study="Size", n=n, Dist=nm,
+        Method="General test of h=0",
+        RejectRate=p_h,
+        SE=sqrt(p_h*(1-p_h)/nsim),
+        nsim=nsim, B=B, K=K,
+        m_power = NA_real_
+      ); idx <- idx + 1
+    }
+  }
+
+  do.call(rbind, out)
+}
+
+##################### ----- Fig7_1 ---------#####################
+library(ggplot2)
+
+plot_size_compare <- function(df, alpha = 0.05) {
+  ggplot(df, aes(x=factor(n), y=RejectRate, color=Method, group=Method)) +
+    geom_line(linewidth=1) +
+    geom_point(size=2) +
+    geom_errorbar(aes(ymin=pmax(0, RejectRate-1.96*SE),
+                      ymax=pmin(1, RejectRate+1.96*SE)),
+                  width=0.2) +
+    facet_wrap(~Dist, nrow=1) +
+    geom_hline(yintercept=alpha, linetype="dashed") +
+    labs(x="Sample size n", y="Rejection rate") +
+    theme_minimal(base_size=14)
+}
+########################
+
+size_df_m <- run_size_compare_fast(sample_sizes=c(20,40,80,160),
+                              nsim=3000, B=1000, K=31,
+                              use_m_out_of_n = TRUE,
+                              seed=123)
+plot_size_compare(size_df_m)
+
+
+
+
+
+
+#########################
+#### Power study ########
+#########################
+
+alpha_new <- function(alpha, d0 = 1, d1 = 2) {
+  cval <- qchisq(1 - alpha, df = d1 - d0)
+  1 - pchisq(cval, df = d1)
+}
+#################
+boot_th_and_h <- function(x, B = 1000,
+                          use_m_out_of_n = FALSE,
+                          m_power = 0.7) {
+  n <- length(x)
+
+  if (!use_m_out_of_n) {
+    m <- n
+  } else {
+    m <- max(10L, floor(n^m_power))
+  }
+
+  idx <- matrix(sample.int(n, size = m * B, replace = TRUE),
+                nrow = m, ncol = B)
+  x_star <- matrix(x[idx], nrow = m, ncol = B)
+
+  means <- colMeans(x_star)
+  meds  <- apply(x_star, 2, median)
+
+  th_star <- cbind(means, meds)
+
+  Sigma_hat <- cov(th_star)
+  if (use_m_out_of_n) {
+    Sigma_hat <- Sigma_hat * (m / n)
+  }
+
+  # ---- h bootstrap, scaled to n-level when m-out-of-n ----
+  h_hat  <- mean(x) - median(x)
+  h_star <- means - meds
+
+  if (use_m_out_of_n) {
+    h_star <- h_hat + sqrt(m / n) * (h_star - h_hat)
+  }
+
+  list(
+    th_hat = c(mean(x), median(x)),
+    Sigma_hat = Sigma_hat,
+    h_hat = h_hat,
+    h_star = h_star,
+    m = m, n = n
+  )
+}
+
+
+#################
+test_pointwise_diag_fast <- function(x, alpha = 0.05,
+                                     delta = function(x) 3 * sd(x) / sqrt(length(x)),
+                                     K = 31,
+                                     B = 1000,
+                                     use_m_out_of_n = FALSE,
+                                     m_power = 0.7,
+                                     ridge = 1e-10) {
+
+  bt <- boot_th_and_h(x, B = B,
+                      use_m_out_of_n = use_m_out_of_n,
+                      m_power = m_power)
+
+  th_hat <- bt$th_hat
+  Sigma_hat <- bt$Sigma_hat
+
+  Sinv <- solve(Sigma_hat + diag(ridge, 2))
+
+  a_new <- alpha_new(alpha, d0 = 1, d1 = 2)
+  q2 <- qchisq(1 - a_new, df = 2)
+
+  delt <- if (is.function(delta)) delta(x) else delta
+  xbar <- th_hat[1]
+  tgrid <- seq(xbar - delt, xbar + delt, length.out = K)
+
+  # D is K x 2 matrix of (mean - t, median - t)
+  D <- cbind(th_hat[1] - tgrid, th_hat[2] - tgrid)
+
+  # quadratic form for each row: d' Sinv d
+  stats <- rowSums((D %*% Sinv) * D)
+
+  list(
+    reject = all(stats > q2),
+    alpha_new = a_new,
+    q = q2,
+    delta_used = delt,
+    use_m_out_of_n = use_m_out_of_n
+  )
+}
+## -----------------------------
+## Distribution generators
+## -----------------------------
+
+# Nulls: mean = median = 0
+
+r_null_t3 <- function(n) rt(n, df = 3)
+
+r_null_contaminated_normal <- function(n) {
+  z <- rnorm(n)
+  big <- rnorm(n, sd = 8)
+  mix <- rbinom(n, 1, 0.10)
+  ifelse(mix == 1, big, z)
+}
+
+r_null_laplace <- function(n, b = 1) {
+  u <- runif(n) - 0.5
+  -b * sign(u) * log(1 - 2 * abs(u))
+}
+
+# Alternatives (mean != median typically)
+
+r_alt_exp_contam <- function(n, delta, shift = 2) {
+  p <- pmin(pmax(delta, 0), 0.50)  # now p(0)=0
+  z <- rnorm(n)
+  e <- rexp(n) - 1 + shift
+  mix <- rbinom(n, 1, p)
+  ifelse(mix == 1, e, z)
+}
+
+r_alt_spiky_weight <- function(n, delta, sd = 1) {
+  # map delta in [0,0.4] to w in [0.5,0.65]
+  w <- 0.5 + (0.15/0.4) * delta   # = 0.5 + 0.375*delta
+  s <- rbinom(n, 1, w)
+  ifelse(s == 1,  2 + rnorm(n, sd = sd),
+                -2 + rnorm(n, sd = sd))
+}
+
+r_alt_g_and_h <- function(n, delta, h = 0.0) {
+  z <- rnorm(n)
+  g <- delta
+  if (abs(g) < 1e-12) {
+    x <- z * exp(0.5 * h * z^2)
+  } else {
+    x <- (exp(g * z) - 1) / g * exp(0.5 * h * z^2)
+  }
+  x
+}
+
+##################
+test_general_h_from_boot <- function(h_star, alpha = 0.05) {
+  L <- as.numeric(quantile(h_star, probs = alpha/2))
+  U <- as.numeric(quantile(h_star, probs = 1 - alpha/2))
+  list(reject = (0 < L) || (0 > U), L = L, U = U)
+}
+####################
+run_size_compare_fast <- function(sample_sizes = c(10,20,40),
+                                  alpha = 0.05,
+                                  nsim = 2000,
+                                  B = 1000,
+                                  K = 61,
+                                  delta = function(x) 3 * sd(x) / sqrt(length(x)),
+                                  use_m_out_of_n = FALSE,
+                                  m_power = 0.7,
+                                  seed = 1) {
+
+  null_list <- list(
+    "t(df=3)" = r_null_t3,
+    "contaminated normal" = r_null_contaminated_normal,
+    "Laplace" = r_null_laplace
+  )
+
+  set.seed(seed)
+  out <- list(); idx <- 1
+
+  for (n in sample_sizes) {
+    for (nm in names(null_list)) {
+      rP <- null_list[[nm]]
+
+      rej_pw <- logical(nsim)
+      rej_h  <- logical(nsim)
+
+      for (i in seq_len(nsim)) {
+        x <- rP(n)
+
+        # one bootstrap draw reused for both methods
+        bt <- boot_th_and_h(x, B = B,
+                            use_m_out_of_n = use_m_out_of_n,
+                            m_power = m_power)
+
+        # pointwise (vectorized)
+        th_hat <- bt$th_hat
+        Sinv <- solve(bt$Sigma_hat + diag(1e-10, 2))
+
+        a_new <- alpha_new(alpha, 1, 2)
+        q2 <- qchisq(1 - a_new, df = 2)
+
+        delt <- if (is.function(delta)) delta(x) else delta
+        tgrid <- seq(th_hat[1] - delt, th_hat[1] + delt, length.out = K)
+        D <- cbind(th_hat[1] - tgrid, th_hat[2] - tgrid)
+        stats <- rowSums((D %*% Sinv) * D)
+        rej_pw[i] <- all(stats > q2)
+
+        # general h test from same bootstrap
+        rej_h[i] <- test_general_h_from_boot(bt$h_star, alpha = alpha)$reject
+      }
+
+      p_pw <- mean(rej_pw); p_h <- mean(rej_h)
+
+      out[[idx]] <- data.frame(
+        Study="Size", n=n, Dist=nm,
+        Method = if (use_m_out_of_n) "Pointwise over t-grid (m-out-of-n)" else "Pointwise over t-grid",
+        RejectRate=p_pw,
+        SE=sqrt(p_pw*(1-p_pw)/nsim),
+        nsim=nsim, B=B, K=K,
+        m_power = if (use_m_out_of_n) m_power else NA_real_
+      ); idx <- idx + 1
+
+      out[[idx]] <- data.frame(
+        Study="Size", n=n, Dist=nm,
+        Method="Benchmark test of h=0",
+        RejectRate=p_h,
+        SE=sqrt(p_h*(1-p_h)/nsim),
+        nsim=nsim, B=B, K=K,
+        m_power = NA_real_
+      ); idx <- idx + 1
+    }
+  }
+
+  do.call(rbind, out)
+}
+
+run_power_compare_fast2 <- function(n = 40,
+                                    deltas = seq(-0.4, 0.4, by = 0.1),
+                                    alpha = 0.05,
+                                    nsim = 1000,
+                                    B = 500,
+                                    K = 31,
+                                    delta_grid_halfwidth = function(x) 3 * sd(x) / sqrt(length(x)),
+                                    use_m_out_of_n = TRUE,
+                                    m_power = 0.7,
+                                    seed = 2) {
+
+    alt_list <- list(
+    "g-and-h skew"         = function(nn, d) r_alt_g_and_h(nn, delta = d, h = 0),
+    "exp contamination"    = function(nn, d) r_alt_exp_contam(nn, delta = d),   # fixed p(0)=0
+    "Asymmetric Gaussian mixture" = function(nn, d) r_alt_spiky_weight(nn, delta = d)  # use sd=1
+  )
+
+
+  set.seed(seed)
+  out <- list(); idx <- 1
+
+  for (alt_name in names(alt_list)) {
+    rAlt <- alt_list[[alt_name]]
+
+    for (d in deltas) {
+      rej_pw <- logical(nsim)
+      rej_h  <- logical(nsim)
+
+      for (i in seq_len(nsim)) {
+        x <- rAlt(n, d)
+
+        bt <- boot_th_and_h(x, B = B,
+                            use_m_out_of_n = use_m_out_of_n,
+                            m_power = m_power)
+
+        # ---- pointwise over diagonal t-grid ----
+        th_hat <- bt$th_hat
+        Sinv <- solve(bt$Sigma_hat + diag(1e-10, 2))
+        a_new <- alpha_new(alpha, 1, 2)
+        q2 <- qchisq(1 - a_new, df = 2)
+
+        delt_half <- if (is.function(delta_grid_halfwidth)) delta_grid_halfwidth(x) else as.numeric(delta_grid_halfwidth)
+
+        #delt_half <- if (is.function(delta_grid_halfwidth)) delta_grid_halfwidth(x) else delta_grid_halfwidth
+        tgrid <- seq(th_hat[1] - delt_half, th_hat[1] + delt_half, length.out = K)
+
+        D <- cbind(th_hat[1] - tgrid, th_hat[2] - tgrid)
+        stats <- rowSums((D %*% Sinv) * D)
+        rej_pw[i] <- all(stats > q2)
+
+        # ---- general test of h=0 from same bootstrap ----
+        rej_h[i] <- test_general_h_from_boot(bt$h_star, alpha = alpha)$reject
+      }
+
+      p_pw <- mean(rej_pw); p_h <- mean(rej_h)
+
+      out[[idx]] <- data.frame(
+        Study="Power", n=n, Alt=alt_name, delta=d,
+        Method = if (use_m_out_of_n) "Pointwise over t-grid (m-out-of-n)" else "Pointwise over t-grid",
+        RejectRate=p_pw,
+        SE=sqrt(p_pw*(1-p_pw)/nsim),
+        nsim=nsim, B=B, K=K
+      ); idx <- idx + 1
+
+      out[[idx]] <- data.frame(
+        Study="Power", n=n, Alt=alt_name, delta=d,
+        Method="Benchmark test of h=0",
+        RejectRate=p_h,
+        SE=sqrt(p_h*(1-p_h)/nsim),
+        nsim=nsim, B=B, K=K
+      ); idx <- idx + 1
+    }
+  }
+
+  do.call(rbind, out)
+}
+#####################
+library(ggplot2)
+
+plot_size_compare <- function(df, alpha = 0.05) {
+  ggplot(df, aes(x=factor(n), y=RejectRate, color=Method, group=Method)) +
+    geom_line(linewidth=1) +
+    geom_point(size=2) +
+    geom_errorbar(aes(ymin=pmax(0, RejectRate-1.96*SE),
+                      ymax=pmin(1, RejectRate+1.96*SE)),
+                  width=0.2) +
+    facet_wrap(~Dist, nrow=1) +
+    geom_hline(yintercept=alpha, linetype="dashed") +
+    labs(x="Sample size n", y="Rejection rate") +
+    theme_minimal(base_size=14)
+}
+
+plot_power_compare <- function(df) {
+  library(ggplot2)
+  ggplot(df, aes(x=delta, y=RejectRate, color=Method, group=Method)) +
+    geom_line(linewidth=1) +
+    geom_point(size=2) +
+    geom_errorbar(aes(ymin=pmax(0, RejectRate-1.96*SE),
+                      ymax=pmin(1, RejectRate+1.96*SE)),
+                  width=0.03) +
+    facet_wrap(~Alt, nrow=1, scales="free_y") +
+    geom_hline(yintercept=0.05, linetype="dashed") +
+    labs(x=expression(delta), y="Power (rejection rate)") +
+    theme_minimal(base_size=14)
+}
+
+options(repr.plot.width = 12, repr.plot.height = 4)
+########################
+
+####### ---------- Fig7_2 ------------- ##########
+
+power_df <- run_power_compare_fast2(
+  n=80, deltas=seq(0,0.4,by=0.05),
+  nsim=3000, B=1000, K=31,
+  delta_grid_halfwidth=function(x) 2*sd(x)/sqrt(length(x)),
+  use_m_out_of_n=TRUE, seed=123
+)
+
+#Plot without comparing the grid.
+ggplot(power_df, aes(x=delta, y=RejectRate, color=Method, group=Method)) +
+  geom_line(linewidth=1) +
+  geom_point(size=2) +
+  geom_errorbar(aes(ymin=pmax(0, RejectRate-1.96*SE),
+                    ymax=pmin(1, RejectRate+1.96*SE)),
+                width=0.02) +
+  facet_wrap(~Alt, nrow=1, scales="free_y") +
+  geom_hline(yintercept=0.05, linetype="dashed") +
+  labs(x=expression(delta), y="Power (rejection rate)") +
+  theme_minimal(base_size=14)
+
+
+#####################################################################
+#### For the Asymmetric Gaussian Mixture at delta=0 problem, 
+#### we add it to the null list of the size study to compare with the other null distributions.
+#################################################################################################
+
+alpha_new <- function(alpha, d0 = 1, d1 = 2) {
+  cval <- qchisq(1 - alpha, df = d1 - d0)
+  1 - pchisq(cval, df = d1)
+}
+#################
+boot_th_and_h <- function(x, B = 1000,
+                          use_m_out_of_n = FALSE,
+                          m_power = 0.7) {
+  n <- length(x)
+
+  if (!use_m_out_of_n) {
+    m <- n
+  } else {
+    m <- max(10L, floor(n^m_power))
+  }
+
+  idx <- matrix(sample.int(n, size = m * B, replace = TRUE),
+                nrow = m, ncol = B)
+  x_star <- matrix(x[idx], nrow = m, ncol = B)
+
+  means <- colMeans(x_star)
+  meds  <- apply(x_star, 2, median)
+
+  th_star <- cbind(means, meds)
+
+  Sigma_hat <- cov(th_star)
+  if (use_m_out_of_n) {
+    Sigma_hat <- Sigma_hat * (m / n)
+  }
+
+  # ---- h bootstrap, scaled to n-level when m-out-of-n ----
+  h_hat  <- mean(x) - median(x)
+  h_star <- means - meds
+
+  if (use_m_out_of_n) {
+    h_star <- h_hat + sqrt(m / n) * (h_star - h_hat)
+  }
+
+  list(
+    th_hat = c(mean(x), median(x)),
+    Sigma_hat = Sigma_hat,
+    h_hat = h_hat,
+    h_star = h_star,
+    m = m, n = n
+  )
+}
+
+
+#################
+test_pointwise_diag_fast <- function(x, alpha = 0.05,
+                                     delta = function(x) 2 * sd(x) / sqrt(length(x)),
+                                     K = 31,
+                                     B = 1000,
+                                     use_m_out_of_n = FALSE,
+                                     m_power = 0.7,
+                                     ridge = 1e-10) {
+
+  bt <- boot_th_and_h(x, B = B,
+                      use_m_out_of_n = use_m_out_of_n,
+                      m_power = m_power)
+
+  th_hat <- bt$th_hat
+  Sigma_hat <- bt$Sigma_hat
+
+  Sinv <- solve(Sigma_hat + diag(ridge, 2))
+
+  a_new <- alpha_new(alpha, d0 = 1, d1 = 2)
+  q2 <- qchisq(1 - a_new, df = 2)
+
+  delt <- if (is.function(delta)) delta(x) else delta
+  xbar <- th_hat[1]
+  tgrid <- seq(xbar - delt, xbar + delt, length.out = K)
+
+  # D is K x 2 matrix of (mean - t, median - t)
+  D <- cbind(th_hat[1] - tgrid, th_hat[2] - tgrid)
+
+  # quadratic form for each row: d' Sinv d
+  stats <- rowSums((D %*% Sinv) * D)
+
+  list(
+    reject = all(stats > q2),
+    alpha_new = a_new,
+    q = q2,
+    delta_used = delt,
+    use_m_out_of_n = use_m_out_of_n
+  )
+}
+## -----------------------------
+## Distribution generators
+## -----------------------------
+
+# Nulls: mean = median = 0
+
+r_null_t3 <- function(n) rt(n, df = 3)
+
+r_null_contaminated_normal <- function(n) {
+  z <- rnorm(n)
+  big <- rnorm(n, sd = 8)
+  mix <- rbinom(n, 1, 0.10)
+  ifelse(mix == 1, big, z)
+}
+
+r_null_laplace <- function(n, b = 1) {
+  u <- runif(n) - 0.5
+  -b * sign(u) * log(1 - 2 * abs(u))
+}
+
+#########################
+## add the asymetric Gaussian mixture with delta=0 to the list of nulls
+##########################
+
+r_null_asym_gaussian_mix0 <- function(n, sd = 1) {
+  # delta = 0 case of the "Asymmetric Gaussian mixture" from the power study
+  # When delta = 0, w = 0.5
+  w <- 0.5
+  s <- rbinom(n, 1, w)
+  ifelse(s == 1,
+         2 + rnorm(n, sd = sd),
+        -2 + rnorm(n, sd = sd))
+}
+###########################
+
+
+# Alternatives (mean != median typically)
+
+r_alt_spiky_multimodal <- function(n) {
+  s <- sample(c(-1, 1), size = n, replace = TRUE)
+  s * 2 + rnorm(n, sd = 0.25)
+}
+
+r_alt_shifted_exp <- function(n, delta = 0) {
+  (rexp(n) - 1) + delta
+}
+
+# IMPORTANT: recenter by population mean (not sample mean) for stability
+r_alt_pointmass_exp <- function(n, p0 = 0.30, delta = 0) {
+  u <- runif(n)
+  x <- ifelse(u < p0, 0, rexp(n))
+  x - (1 - p0) + delta
+}
+
+##################
+test_general_h_from_boot <- function(h_star, alpha = 0.05) {
+  L <- as.numeric(quantile(h_star, probs = alpha/2))
+  U <- as.numeric(quantile(h_star, probs = 1 - alpha/2))
+  list(reject = (0 < L) || (0 > U), L = L, U = U)
+}
+####################
+run_size_compare_fast <- function(sample_sizes = c(10,20,40),
+                                  alpha = 0.05,
+                                  nsim = 2000,
+                                  B = 1000,
+                                  K = 61,
+                                  delta = function(x) 2 * sd(x) / sqrt(length(x)),
+                                  use_m_out_of_n = FALSE,
+                                  m_power = 0.7,
+                                  seed = 1) {
+
+
+  null_list <- list(
+  "t(df=3)" = r_null_t3,
+  "contaminated normal" = r_null_contaminated_normal,
+  "Laplace" = r_null_laplace,
+  "Symmetric Gaussian mixture" = r_null_asym_gaussian_mix0 # add Asymmetric Gaussian mixture with delta=0
+)
+
+  set.seed(seed)
+  out <- list(); idx <- 1
+
+  for (n in sample_sizes) {
+    for (nm in names(null_list)) {
+      rP <- null_list[[nm]]
+
+      rej_pw <- logical(nsim)
+      rej_h  <- logical(nsim)
+
+      for (i in seq_len(nsim)) {
+        x <- rP(n)
+
+        # one bootstrap draw reused for both methods
+        bt <- boot_th_and_h(x, B = B,
+                            use_m_out_of_n = use_m_out_of_n,
+                            m_power = m_power)
+
+        # pointwise (vectorized)
+        th_hat <- bt$th_hat
+        Sinv <- solve(bt$Sigma_hat + diag(1e-10, 2))
+
+        a_new <- alpha_new(alpha, 1, 2)
+        q2 <- qchisq(1 - a_new, df = 2)
+
+        delt <- if (is.function(delta)) delta(x) else delta
+        tgrid <- seq(th_hat[1] - delt, th_hat[1] + delt, length.out = K)
+        D <- cbind(th_hat[1] - tgrid, th_hat[2] - tgrid)
+        stats <- rowSums((D %*% Sinv) * D)
+        rej_pw[i] <- all(stats > q2)
+
+        # general h test from same bootstrap
+        rej_h[i] <- test_general_h_from_boot(bt$h_star, alpha = alpha)$reject
+      }
+
+      p_pw <- mean(rej_pw); p_h <- mean(rej_h)
+
+      out[[idx]] <- data.frame(
+        Study="Size", n=n, Dist=nm,
+        Method = if (use_m_out_of_n) "Pointwise over t-grid (m-out-of-n)" else "Pointwise over t-grid",
+        RejectRate=p_pw,
+        SE=sqrt(p_pw*(1-p_pw)/nsim),
+        nsim=nsim, B=B, K=K,
+        m_power = if (use_m_out_of_n) m_power else NA_real_
+      ); idx <- idx + 1
+
+      out[[idx]] <- data.frame(
+        Study="Size", n=n, Dist=nm,
+        Method="Benchmark test of h=0",
+        RejectRate=p_h,
+        SE=sqrt(p_h*(1-p_h)/nsim),
+        nsim=nsim, B=B, K=K,
+        m_power = NA_real_
+      ); idx <- idx + 1
+    }
+  }
+
+  do.call(rbind, out)
+}
+
+########## ---------- Fig7_3 -------------- #############
+
+library(ggplot2)
+
+plot_size_compare <- function(df, alpha = 0.05) {
+  ggplot(df, aes(x=factor(n), y=RejectRate, color=Method, group=Method)) +
+    geom_line(linewidth=1) +
+    geom_point(size=2) +
+    geom_errorbar(aes(ymin=pmax(0, RejectRate-1.96*SE),
+                      ymax=pmin(1, RejectRate+1.96*SE)),
+                  width=0.2) +
+    facet_wrap(~Dist, nrow=1) +
+    geom_hline(yintercept=alpha, linetype="dashed") +
+    labs(x="Sample size n", y="Rejection rate") +
+    theme_minimal(base_size=14)
+}
+
+size_df_m <- run_size_compare_fast(sample_sizes=c(20,40,80,160),
+                              nsim=3000, B=1000, K=31,
+                              use_m_out_of_n = TRUE,
+                              seed=123)
+options(repr.plot.width = 14, repr.plot.height = 4)
+plot_size_compare(size_df_m)
+########################
+
