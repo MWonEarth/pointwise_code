@@ -1,0 +1,639 @@
+## ============================================================
+## Pointwise rejection for H0: median = 0 using KS over a null dictionary
+## Two-sided alternative
+## ============================================================
+
+## ---------- 1) Null dictionary: fully specified median-0 distributions ----------
+# We need for each F_k:
+#  - r(n): sampler
+#  - p(x): CDF function for ks.test
+
+make_null_dictionary <- function() {
+  dict <- list()
+
+  ## 1) Normal(0,1)
+  dict[["N(0,1)"]] <- list(
+    r = function(n) rnorm(n, 0, 1),
+    p = function(x) pnorm(x, 0, 1)
+  )
+
+  ## 2) Laplace(0,1)
+  rlaplace01 <- function(n) {
+    u <- runif(n)
+    ifelse(u < 0.5, log(2*u), -log(2*(1-u)))
+  }
+  plaplace01 <- function(x) {
+    ifelse(x < 0, 0.5*exp(x), 1 - 0.5*exp(-x))
+  }
+  dict[["Laplace(0,1)"]] <- list(r = rlaplace01, p = plaplace01)
+
+  ## 3) t distributions (df fixed) — SAFE CAPTURE USING local()
+  for (nu in c(3, 5, 10)) {
+    dict[[paste0("t(df=", nu, ")")]] <- local({
+      nu0 <- nu
+      list(
+        r = function(n) rt(n, df = nu0),
+        p = function(x) pt(x, df = nu0)
+      )
+    })
+  }
+
+  ## 4) Contaminated normal mixtures: (1-eps)N(0,1) + eps N(0,9)
+  mix_cdf <- function(x, eps, sd2) {
+    (1 - eps) * pnorm(x, 0, 1) + eps * pnorm(x, 0, sd2)
+  }
+  mix_r <- function(n, eps, sd2) {
+    z <- rbinom(n, 1, eps)
+    rnorm(n, 0, ifelse(z == 1, sd2, 1))
+  }
+
+  for (eps in c(0.05, 0.10)) {
+    dict[[paste0("ContamN(eps=", eps, ",sd=3)")]] <- local({
+      eps0 <- eps
+      list(
+        r = function(n) mix_r(n, eps = eps0, sd2 = 3),
+        p = function(x) mix_cdf(x, eps = eps0, sd2 = 3)
+      )
+    })
+  }
+
+  dict
+}
+
+null_dict <- make_null_dictionary()
+names(null_dict)
+
+
+
+## ---------- 2) KS p-values against each candidate ----------
+ks_pvals_against_dict <- function(x, dict) {
+  sapply(dict, function(Fk) {
+    # one-sample KS: compare empirical CDF to specified Fk CDF
+    ks.test(x, Fk$p)$p.value
+  })
+}
+
+## ---------- 3) Pointwise rejection rule ----------
+# Reject if max p-value is small (all candidates look implausible)
+pointwise_reject <- function(x, dict, alpha_new) {
+  pvals <- ks_pvals_against_dict(x, dict)
+  as.integer(max(pvals) <= alpha_new)
+}
+
+## ---------- 4) Calibrate alpha_new by simulation (worst-case over null candidates) ----------
+# We simulate under each F_k, compute M = max_j p_j, then find a threshold
+# alpha_new such that P(M <= alpha_new) <= alpha for each k.
+calibrate_alpha_new <- function(n, dict, alpha=0.05, nsim=2000, seed=1) {
+  set.seed(seed)
+  M_by_k <- matrix(NA_real_, nrow=nsim, ncol=length(dict))
+  colnames(M_by_k) <- names(dict)
+
+  for (k in seq_along(dict)) {
+    Fk <- dict[[k]]
+    for (b in 1:nsim) {
+      x <- Fk$r(n)
+      pvals <- ks_pvals_against_dict(x, dict)
+      M_by_k[b, k] <- max(pvals)
+    }
+  }
+
+  # For each generating null k, find alpha-quantile of M.
+  # To be conservative (level alpha for all k), take the minimum across k.
+  q_by_k <- apply(M_by_k, 2, quantile, probs=alpha, type=8, names=FALSE)
+  alpha_new <- min(q_by_k)
+
+  list(alpha_new=alpha_new, q_by_k=q_by_k, M_by_k=M_by_k)
+}
+
+## ---------- 5) Competing methods: sign test and Wilcoxon signed-rank ----------
+sign_test_pval <- function(x) {
+  # drop zeros for continuity robustness
+  x2 <- x[x != 0]
+  n2 <- length(x2)
+  S <- sum(x2 > 0)
+  # exact two-sided binomial p-value
+  p_lo <- pbinom(S, n2, 0.5)
+  p_hi <- 1 - pbinom(S - 1, n2, 0.5)
+  2 * min(p_lo, p_hi)
+}
+
+wilcoxon_pval <- function(x) {
+  wilcox.test(x, mu=0, alternative="two.sided", exact=FALSE)$p.value
+}
+
+## ---------- 6) Run size/power simulation ----------
+run_power_study_twosided_avg <- function(
+  sample_sizes = c(10, 20, 40, 80),
+  deltas_abs = c(0, 0.1, 0.2, 0.3, 0.4),
+  base_null_name = "N(0,1)",
+  alpha = 0.05,
+  nsim_cal = 2000,
+  nsim_pow = 2000,
+  seed = 1
+) {
+  set.seed(seed)
+
+  out <- list()
+  idx <- 1
+
+  for (n in sample_sizes) {
+
+    # calibrate alpha_new
+    cal <- calibrate_alpha_new(n=n, dict=null_dict, alpha=alpha,
+                               nsim=nsim_cal, seed=seed + 1000 + n)
+    alpha_new <- cal$alpha_new
+
+    for (d in deltas_abs) {
+
+      deltas_use <- if (d == 0) c(0) else c(-d, d)
+
+      rej_mat <- matrix(0, nrow=length(deltas_use), ncol=3)
+      colnames(rej_mat) <- c("Pointwise-KS", "Sign", "Wilcoxon")
+
+      for (s in seq_along(deltas_use)) {
+        delta <- deltas_use[s]
+
+        rej_point <- 0
+        rej_sign  <- 0
+        rej_wilc  <- 0
+
+        for (b in 1:nsim_pow) {
+          z <- null_dict[[base_null_name]]$r(n)
+          x <- z + delta
+
+          rej_point <- rej_point + as.integer(max(ks_pvals_against_dict(x, null_dict)) <= alpha_new)
+          rej_sign  <- rej_sign  + as.integer(sign_test_pval(x) <= alpha)
+          rej_wilc  <- rej_wilc  + as.integer(wilcoxon_pval(x) <= alpha)
+        }
+
+        rej_mat[s, ] <- c(rej_point, rej_sign, rej_wilc) / nsim_pow
+      }
+
+      avg_rates <- colMeans(rej_mat)
+
+      # Monte Carlo SE for averaged rejection rate
+      # Note: this is an approximation, but works well and is standard.
+      se_rates <- sqrt(avg_rates * (1 - avg_rates) / nsim_pow)
+
+      out[[idx]] <- data.frame(
+        n = n,
+        delta_abs = d,
+        alpha_new = alpha_new,
+        method = names(avg_rates),
+        reject_rate = as.numeric(avg_rates),
+        se = as.numeric(se_rates),
+        nsim = nsim_pow
+      )
+
+      idx <- idx + 1
+    }
+  }
+
+  do.call(rbind, out)
+}
+
+
+
+## ---------- 7) Example run ----------
+res2 <- run_power_study_twosided_avg(
+  sample_sizes = c(10, 20, 40),
+  deltas_abs = c(0, 0.1, 0.2, 0.3),
+  base_null_name = "N(0,1)",
+  alpha = 0.05,
+  nsim_cal = 5000,
+  nsim_pow = 5000,
+  seed = 1
+)
+
+head(res2, 12)
+
+
+print(head(res2, 12))
+
+## ---------- 8) Plot ---------- Fig7_4 -----------------
+
+# Requires ggplot2
+if (requireNamespace("ggplot2", quietly = TRUE)) {
+
+library(ggplot2)
+
+res2$lower <- pmax(0, res2$reject_rate - 1.96 * res2$se)
+res2$upper <- pmin(1, res2$reject_rate + 1.96 * res2$se)
+
+ggplot(res2, aes(x=delta_abs, y=reject_rate, color=method, group=method)) +
+  geom_line(linewidth=1) +
+  geom_point(size=2) +
+  geom_errorbar(aes(ymin=lower, ymax=upper), width=0.02, linewidth=0.7) +
+  facet_wrap(~ n, nrow=1) +
+  scale_x_continuous(breaks=c(0,0.1,0.2,0.3)) +
+  geom_hline(yintercept=0.05, linetype="dashed") +
+  labs(
+    x = expression(paste("|", delta, "|  (two-sided median shift)")),
+    y = "Rejection rate / Power",
+    color = "Method"
+  ) +
+  theme_minimal(base_size=14) +
+  theme(panel.spacing.x = unit(1.2, "lines"))
+
+
+}
+
+
+######################################################################
+## sample-splitting (data-driven dictionary) version with two dictionaries
+# Split data into A (selection) and B (test).
+# Use A to choose between candidate dictionaries (e.g., symmetric vs skewed-Gamma).
+# Calibrate α_new for the chosen dictionary at n_B
+# Compute pointwise-KS p-values on B and reject if max(p_k) ≤ α_new
+######################################################################
+
+## ============================================================
+## Pointwise rejection for H0: median = 0 using KS over a null dictionary
+## Two-sided alternative
+## ============================================================
+
+## ---------- 1) Null dictionary: fully specified median-0 distributions ----------
+# We need for each F_k:
+#  - r(n): sampler
+#  - p(x): CDF function for ks.test
+
+make_symmetric_dictionary <- function() {
+  dict <- list()
+
+  dict[["N(0,1)"]] <- list(
+    r = function(n) rnorm(n, 0, 1),
+    p = function(x) pnorm(x, 0, 1)
+  )
+
+  rlaplace01 <- function(n) {
+    u <- runif(n)
+    ifelse(u < 0.5, log(2*u), -log(2*(1-u)))
+  }
+  plaplace01 <- function(x) {
+    ifelse(x < 0, 0.5*exp(x), 1 - 0.5*exp(-x))
+  }
+  dict[["Laplace(0,1)"]] <- list(r = rlaplace01, p = plaplace01)
+
+  for (nu in c(3, 5, 10)) {
+    dict[[paste0("t(df=", nu, ")")]] <- local({
+      nu0 <- nu
+      list(
+        r = function(n) rt(n, df = nu0),
+        p = function(x) pt(x, df = nu0)
+      )
+    })
+  }
+
+  mix_cdf <- function(x, eps, sd2) {
+    (1 - eps) * pnorm(x, 0, 1) + eps * pnorm(x, 0, sd2)
+  }
+  mix_r <- function(n, eps, sd2) {
+    z <- rbinom(n, 1, eps)
+    rnorm(n, 0, ifelse(z == 1, sd2, 1))
+  }
+
+  for (eps in c(0.05, 0.10)) {
+    dict[[paste0("ContamN(eps=", eps, ",sd=3)")]] <- local({
+      eps0 <- eps
+      list(
+        r = function(n) mix_r(n, eps = eps0, sd2 = 3),
+        p = function(x) mix_cdf(x, eps = eps0, sd2 = 3)
+      )
+    })
+  }
+
+  dict
+}
+
+make_gamma_dictionary <- function(shapes = c(2,3,5), rate = 1) {
+  dict <- list()
+  for (sh in shapes) {
+    dict[[paste0("Gamma(sh=", sh, ",med0)")]] <- local({
+      sh0 <- sh
+      rate0 <- rate
+      med0 <- qgamma(0.5, shape = sh0, rate = rate0)
+      list(
+        r = function(n) rgamma(n, shape = sh0, rate = rate0) - med0,
+        p = function(x) pgamma(x + med0, shape = sh0, rate = rate0)
+      )
+    })
+  }
+  dict
+}
+
+## =======================
+## Functions of tests
+##========================
+
+## ---------- KS p-values against a dictionary ----------
+ks_pvals_against_dict <- function(x, dict) {
+  sapply(dict, function(Fk) {
+    ks.test(x, Fk$p)$p.value
+  })
+}
+
+## ---------- Calibrate alpha_new by simulation (worst-case over candidates) ----------
+calibrate_alpha_new <- function(n, dict, alpha = 0.05, nsim = 2000, seed = 1) {
+  set.seed(seed)
+  M_by_k <- matrix(NA_real_, nrow = nsim, ncol = length(dict))
+  colnames(M_by_k) <- names(dict)
+
+  for (k in seq_along(dict)) {
+    Fk <- dict[[k]]
+    for (b in 1:nsim) {
+      x <- Fk$r(n)
+      pvals <- ks_pvals_against_dict(x, dict)
+      M_by_k[b, k] <- max(pvals)
+    }
+  }
+
+  q_by_k <- apply(M_by_k, 2, quantile, probs = alpha, type = 8, names = FALSE)
+  alpha_new <- min(q_by_k)
+
+  list(alpha_new = alpha_new, q_by_k = q_by_k, M_by_k = M_by_k)
+}
+
+## ---------- Sign test p-value (two-sided) ----------
+sign_test_pval <- function(x) {
+  x2 <- x[x != 0]
+  n2 <- length(x2)
+  S <- sum(x2 > 0)
+  p_lo <- pbinom(S, n2, 0.5)
+  p_hi <- 1 - pbinom(S - 1, n2, 0.5)
+  2 * min(p_lo, p_hi)
+}
+
+## ---------- Wilcoxon signed-rank p-value (two-sided) ----------
+wilcoxon_pval <- function(x) {
+  wilcox.test(x, mu = 0, alternative = "two.sided", exact = FALSE)$p.value
+}
+
+
+
+
+## ============================================================
+## FAST sample-splitting pointwise KS:
+## - Split data into A (select dictionary) and B (test)
+## - Precompute alpha_new for each (dictionary, nB) once
+## - Two-sided alternative summarized by averaging ±delta
+## ============================================================
+
+## ---------- 0) Already have these from earlier ----------
+## ks_pvals_against_dict(), calibrate_alpha_new(), sign_test_pval(), wilcoxon_pval()
+## plus the dictionary builders make_symmetric_dictionary(), make_gamma_dictionary()
+
+sym_dict   <- make_symmetric_dictionary()
+gamma_dict <- make_gamma_dictionary(shapes = c(2,3,5))
+
+## ---------- 1) Dictionary selection on split A ----------
+dict_fit_score <- function(x, dict) {
+  min(sapply(dict, function(Fk) as.numeric(ks.test(x, Fk$p)$statistic)))
+}
+
+choose_dictionary <- function(xA, sym_dict, gamma_dict) {
+  score_sym   <- dict_fit_score(xA, sym_dict)
+  score_gamma <- dict_fit_score(xA, gamma_dict)
+
+  if (score_gamma < score_sym) {
+    list(name="Gamma", dict=gamma_dict, score_sym=score_sym, score_gamma=score_gamma)
+  } else {
+    list(name="Symmetric", dict=sym_dict, score_sym=score_sym, score_gamma=score_gamma)
+  }
+}
+
+
+
+## ---------- 2) Precompute alpha_new for each nB and dictionary ----------
+precompute_alpha_news <- function(
+  sample_sizes,
+  split_frac = 0.3,
+  sym_dict,
+  gamma_dict,
+  alpha = 0.05,
+  nsim_cal = 5000,
+  seed = 1
+) {
+  set.seed(seed)
+
+  alpha_sym   <- setNames(numeric(length(sample_sizes)), sample_sizes)
+  alpha_gamma <- setNames(numeric(length(sample_sizes)), sample_sizes)
+
+  for (n in sample_sizes) {
+    nB <- n - floor(n*split_frac)
+
+    cal_sym <- calibrate_alpha_new(
+      n = nB, dict = sym_dict, alpha = alpha, nsim = nsim_cal,
+      seed = seed + 1000 + n
+    )
+    cal_gam <- calibrate_alpha_new(
+      n = nB, dict = gamma_dict, alpha = alpha, nsim = nsim_cal,
+      seed = seed + 2000 + n
+    )
+
+    alpha_sym[as.character(n)]   <- cal_sym$alpha_new
+    alpha_gamma[as.character(n)] <- cal_gam$alpha_new
+  }
+
+  list(alpha_sym = alpha_sym, alpha_gamma = alpha_gamma)
+}
+
+## ---------- 3) One replicate: split, select dictionary, test on B ----------
+split_pointwise_one <- function(
+  x,
+  sym_dict,
+  gamma_dict,
+  alpha_new_sym,
+  alpha_new_gamma,
+  split_frac = 0.3,
+  seed = NULL
+) {
+  if (!is.null(seed)) set.seed(seed)
+
+  n <- length(x)
+  idx <- sample.int(n)
+  nA <- floor(n * split_frac)
+
+  A <- x[idx[1:nA]]
+  B <- x[idx[(nA+1):n]]
+
+  choice <- choose_dictionary(A, sym_dict, gamma_dict)
+
+  if (choice$name == "Gamma") {
+    alpha_new <- alpha_new_gamma
+    dict_use  <- gamma_dict
+  } else {
+    alpha_new <- alpha_new_sym
+    dict_use  <- sym_dict
+  }
+
+  pvals_B <- ks_pvals_against_dict(B, dict_use)
+  reject  <- as.integer(max(pvals_B) <= alpha_new)
+
+  list(reject = reject, chosen = choice$name)
+}
+
+## ---------- 4) Simulation study (two-sided avg), compares 3 methods ----------
+run_split_power_study_twosided_avg_fast <- function(
+  sample_sizes = c(10, 20, 40),
+  deltas_abs   = c(0, 0.1, 0.2, 0.3),
+  base_r       = function(n) rnorm(n),  # generator for Z, then X = Z + delta
+  sym_dict,
+  gamma_dict,
+  alpha_new_sym_vec,
+  alpha_new_gamma_vec,
+  alpha = 0.05,
+  nsim = 5000,
+  split_frac = 0.3,
+  seed = 1
+) {
+  set.seed(seed)
+
+  out <- list()
+  idx <- 1
+
+  for (n in sample_sizes) {
+    nB <- n - floor(n * split_frac)
+    alpha_new_sym   <- as.numeric(alpha_new_sym_vec[as.character(n)])
+    alpha_new_gamma <- as.numeric(alpha_new_gamma_vec[as.character(n)])
+
+    for (d in deltas_abs) {
+      deltas_use <- if (d == 0) c(0) else c(-d, d)
+
+      # store for +d and -d then average
+      rej_point_side <- numeric(length(deltas_use))
+      rej_sign_side  <- numeric(length(deltas_use))
+      rej_wilc_side  <- numeric(length(deltas_use))
+      gamma_chosen_side <- numeric(length(deltas_use))
+
+      for (s in seq_along(deltas_use)) {
+        delta <- deltas_use[s]
+
+        rej_point <- integer(nsim)
+        rej_sign  <- integer(nsim)
+        rej_wilc  <- integer(nsim)
+        ch_gamma  <- integer(nsim)
+
+        for (b in 1:nsim) {
+          z <- base_r(n)
+          x <- z + delta
+
+          # pointwise split
+          ans <- split_pointwise_one(
+            x = x,
+            sym_dict = sym_dict,
+            gamma_dict = gamma_dict,
+            alpha_new_sym = alpha_new_sym,
+            alpha_new_gamma = alpha_new_gamma,
+            split_frac = split_frac,
+            seed = seed + 100000*n + 1000*s + b
+          )
+
+          rej_point[b] <- ans$reject
+          ch_gamma[b]  <- as.integer(ans$chosen == "Gamma")
+
+          # classical tests on full sample (not split; these are baselines)
+          rej_sign[b] <- as.integer(sign_test_pval(x) <= alpha)
+          rej_wilc[b] <- as.integer(wilcoxon_pval(x) <= alpha)
+        }
+
+        rej_point_side[s] <- mean(rej_point)
+        rej_sign_side[s]  <- mean(rej_sign)
+        rej_wilc_side[s]  <- mean(rej_wilc)
+        gamma_chosen_side[s] <- mean(ch_gamma)
+      }
+
+      # two-sided average over ±d
+      point_avg <- mean(rej_point_side)
+      sign_avg  <- mean(rej_sign_side)
+      wilc_avg  <- mean(rej_wilc_side)
+
+      # MC SEs (standard approx)
+      point_se <- sqrt(point_avg * (1 - point_avg) / nsim)
+      sign_se  <- sqrt(sign_avg  * (1 - sign_avg)  / nsim)
+      wilc_se  <- sqrt(wilc_avg  * (1 - wilc_avg)  / nsim)
+
+      gamma_chosen_avg <- mean(gamma_chosen_side)
+
+      out[[idx]] <- data.frame(
+        n = n, nB = nB, delta_abs = d,
+        method = c("Pointwise-KS (split)", "Sign", "Wilcoxon"),
+        reject_rate = c(point_avg, sign_avg, wilc_avg),
+        se = c(point_se, sign_se, wilc_se),
+        nsim = nsim,
+        alpha_new_sym = alpha_new_sym,
+        alpha_new_gamma = alpha_new_gamma,
+        gamma_chosen_rate = gamma_chosen_avg
+
+      )
+      idx <- idx + 1
+    }
+  }
+
+  do.call(rbind, out)
+}
+
+## ---------- 5) Example: Gamma truth with data-driven dictionary selection ----------
+# Base generator for Gamma(sh=2, med0)
+base_r_gamma2_med0 <- local({
+  sh0 <- 2
+  med0 <- qgamma(0.5, shape = sh0, rate = 1)
+  function(n) rgamma(n, shape = sh0, rate = 1) - med0
+})
+
+sample_sizes <- c(10, 20, 40, 80)
+deltas_abs   <- c(0, 0.1, 0.2, 0.3)
+
+# Precompute alpha_new's (this is the big speed win)
+pre <- precompute_alpha_news(
+  sample_sizes = sample_sizes,
+  split_frac = 0.3,
+  sym_dict = sym_dict,
+  gamma_dict = gamma_dict,
+  alpha = 0.05,
+  nsim_cal = 50000,
+  seed = 123
+)
+
+# Run power/size
+res_split_gamma <- run_split_power_study_twosided_avg_fast(
+  sample_sizes = sample_sizes,
+  deltas_abs   = deltas_abs,
+  base_r       = base_r_gamma2_med0,
+  sym_dict     = sym_dict,
+  gamma_dict   = gamma_dict,
+  alpha_new_sym_vec   = pre$alpha_sym,
+  alpha_new_gamma_vec = pre$alpha_gamma,
+  alpha = 0.05,
+  nsim = 50000,
+  split_frac = 0.3,
+  seed = 46
+)
+
+print(head(res_split_gamma, 12))
+
+## ---------- 6) Plot with 95% MC error bars ---------- Fig7_5 -----------------------
+
+if (requireNamespace("ggplot2", quietly = TRUE)) {
+  library(ggplot2)
+
+  res_split_gamma$lower <- pmax(0, res_split_gamma$reject_rate - 1.96 * res_split_gamma$se)
+  res_split_gamma$upper <- pmin(1, res_split_gamma$reject_rate + 1.96 * res_split_gamma$se)
+
+  ggplot(res_split_gamma, aes(x=delta_abs, y=reject_rate, color=method, group=method)) +
+    geom_line(linewidth=1) +
+    geom_point(size=2) +
+    geom_errorbar(aes(ymin=lower, ymax=upper), width=0.02, linewidth=0.7) +
+    facet_wrap(~ n, nrow=1) +
+    scale_x_continuous(breaks=c(0,0.1,0.2,0.3)) +
+    geom_hline(yintercept=0.05, linetype="dashed") +
+    labs(
+      x = expression(paste("|", delta, "|  (two-sided median shift)")),
+      y = "Rejection rate / Power",
+      color = "Method"
+    ) +
+    theme_minimal(base_size=14) +
+    theme(panel.spacing.x = unit(1.2, "lines"))
+}
+
+## ---------- 7) Inspect how often Gamma dictionary is selected ----------
+subset(res_split_gamma, method == "Pointwise-KS (split)" & delta_abs == 0)[, c("n","gamma_chosen_rate")]
