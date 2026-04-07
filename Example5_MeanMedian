@@ -120,7 +120,7 @@ r_alt_shifted_exp <- function(n, delta = 0) {
   (rexp(n) - 1) + delta
 }
 
-# IMPORTANT: recenter by population mean (not sample mean) for stability
+# Recenter by population mean for stability
 r_alt_pointmass_exp <- function(n, p0 = 0.30, delta = 0) {
   u <- runif(n)
   x <- ifelse(u < p0, 0, rexp(n))
@@ -731,7 +731,7 @@ r_alt_shifted_exp <- function(n, delta = 0) {
   (rexp(n) - 1) + delta
 }
 
-# IMPORTANT: recenter by population mean (not sample mean) for stability
+# Recenter by population mean (not sample mean) for stability
 r_alt_pointmass_exp <- function(n, p0 = 0.30, delta = 0) {
   u <- runif(n)
   x <- ifelse(u < p0, 0, rexp(n))
