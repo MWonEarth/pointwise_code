@@ -172,7 +172,6 @@ run_power_study_twosided_avg <- function(
       avg_rates <- colMeans(rej_mat)
 
       # Monte Carlo SE for averaged rejection rate
-      # Note: this is an approximation, but works well and is standard.
       se_rates <- sqrt(avg_rates * (1 - avg_rates) / nsim_pow)
 
       out[[idx]] <- data.frame(
